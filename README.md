@@ -12,7 +12,7 @@ python main.py                      # the client
 python main.py --check              # verify IMAP + SMTP configuration, then exit
 python main.py --eml-dir samples    # open local .eml files, no account needed
 python main.py --dump unread        # print messages as text (no GUI)
-python tests/run_all.py             # 148 tests
+python tests/run_all.py             # 186 tests
 ```
 
 ---
@@ -100,6 +100,8 @@ mail_sync.py          FolderSynchronizer (pure Python) + SyncWorker/SyncControll
 mail_receiver.py      IMAP: imbox compatibility, folders, search, flags, move, append
 mail_sender.py        SMTP: message building, reply/forward composition, sending
 mail_storage.py       message store: dedup, flags, unread counts, on-disk .eml cache
+outbox.py             disk queue for unsent mail, with exponential backoff
+notifications.py      system tray icon, unread badge, new-mail toasts
 mail_parser.py        raw bytes -> models.Email (MIME tree walk)
 mime_decoder.py       charsets, transfer encodings, RFC 2047 headers, dates
 html_processor.py     HTML whitelist sanitiser, text<->HTML
@@ -108,7 +110,7 @@ models.py             Address, Attachment, Email dataclasses
 config.py             config.ini + environment settings
 logging_setup.py      structured JSON logging with password redaction
 qt_bootstrap.py       fixes PySide6 DLL loading on Windows/conda
-tests/                fake IMAP + fake SMTP servers, 148 tests
+tests/                fake IMAP + fake SMTP servers, 186 tests
 ```
 
 **Threading.** The UI thread performs no network calls. `SyncController` owns one
@@ -128,7 +130,7 @@ per interval, and nothing is rebuilt, so the selection and scroll position survi
 ## 3. Verification report
 
 Everything below was executed on this machine. `python tests/run_all.py` runs the
-whole suite (148 tests, ~55 s).
+whole suite (186 tests, ~55 s).
 
 | # | Feature | What changed / why | How it was verified | Files |
 |---|---|---|---|---|
@@ -146,26 +148,52 @@ whole suite (148 tests, ~55 s).
 | 11 | **Errors** | Timeout, auth, DNS, refused, TLS, disconnect → one message each, with provider hints | `test_receiver` + `test_sender` cover each branch; GUI test shows a wrong password ends as "Sync failed" with an empty list, not a crash | `mail_receiver.py`, `mail_sender.py` |
 | 12 | **Logging** | Console + rotating JSON `logs/mailviewer.log`; a filter scrubs registered secrets and `password=`/`LOGIN` shapes | `test_logging` (7): structured fields survive, registered secrets, `password=` text, `LOGIN` commands and secret-named keys are all masked. Also checked on the real log file written during the Gmail `--check`: 0 occurrences of the stored app password | `logging_setup.py` |
 | 13 | **Configuration** | `config.ini` with `[account] [smtp] [sync] [viewer] [window]`, environment overrides, window geometry remembered | Round-tripped by the GUI tests (each builds settings, saves on close) | `config.py`, `settings_dialog.py` |
+| 16 | **Multiple accounts** | Profiles in `config.ini`; one store + one sync thread + one IMAP connection per account; account roots in the folder tree; From picker in compose | `test_outbox_config` (20): round trip, migration of an old file, distinct cache keys, per-profile SMTP, env override hits only the active profile. `test_gui_integration`: two accounts sync in parallel against two fake servers, switching swaps the list, starring in "Work" leaves "Personal" untouched | `config.py`, `viewer.py`, `mail_sync.py`, `compose_window.py`, `settings_dialog.py` |
+| 17 | **New-mail notifications** | Tray icon with unread badge, toast per arrival, click opens the message, first sync stays silent | `test_gui_integration`: first sync raises no toast, an arriving message raises exactly one, an already-read arrival raises none, badge tracks the mailbox, icon renders with and without a badge | `notifications.py`, `viewer.py`, `config.py` |
+| 18 | **Outbox + SMTP fallback** | Unsent mail is queued to disk and retried with backoff; ports 587/465/25 are tried in turn; failures are classified retryable or not | `test_outbox_config`: persistence across a restart, backoff growth and cap, per-account filtering, exhaustion. `test_sender`: TLS failure on 587 falls back to 465, auth failure is *not* retryable. `test_gui_integration`: a failed send queues, a later retry delivers it and files it in Sent | `outbox.py`, `mail_sender.py`, `viewer.py`, `compose_window.py` |
+| — | **Threading defect** | Worker signals were connected to lambdas, which Qt delivers *directly*, so UI handlers ran inside the sync thread. Signals now carry the account name and the window connects bound methods | The new GUI tests exposed it as "QObject: Cannot create children for a parent in a different thread"; after the fix the whole suite runs clean | `mail_sync.py`, `viewer.py` |
 | 14 | **Architecture** | Twelve focused modules, largest is the UI | — | all |
 | 15 | **UI** | Folder tree, list, preview, attachment pane, status bar, progress bar, unread count, sync indicator | Screenshots taken from the running client against the fake server | `viewer.py` |
 
 ### What could **not** be verified here, and needs your testing
 
-1. **Sending a real message.** Outbound SMTP is blocked on this machine — ports 587,
-   465 and 25 all time out (`WinError 10060`), so `--check` cannot complete the SMTP
-   half. Everything up to the socket is covered by the fake-SMTP tests (build, TLS
-   choice, login, envelope, Sent copy, error handling), but the first real send is
-   yours to run. If 587 is blocked on your network too, switch to
-   Settings → Sending → *SSL/TLS (port 465)*.
-2. **Provider quirks on real folders**: Gmail's `[Gmail]/All Mail` duplicates every
-   message (it is a label, not a folder), and Gmail applies "delete = move to Trash"
-   semantics of its own. Folder listing is verified against your account; deleting and
-   moving are verified only against the fake server.
-3. **Large mailboxes.** Your Inbox has 104 messages and All Mail 4701; the default cap
-   is 200 newest per folder (Settings → Synchronisation). Sync timing on All Mail is
-   untested.
-4. **`mark_seen = True` is set in your `config.ini`**, so opening a message marks it
-   read on the server. Turn it off in Settings → Account if that is not wanted.
+1. **Sending a real message — SMTP is blocked by the VPN on this machine.**
+   Diagnosed step by step:
+
+   | Check | Result |
+   |---|---|
+   | Windows Firewall outbound policy | `DefaultOutboundAction = Allow` on all profiles; no rule matches 25/465/587 |
+   | `smtp.gmail.com` 587 / 465 / 25 | all time out |
+   | `smtp.gmail.com:443` (same host, web port) | also times out |
+   | `imap.gmail.com:993`, `example.com:80` | work |
+   | DNS | resolves to real Google IPs; no sinkhole, no hosts entry |
+   | Default route | `AmneziaVPN` (metric 0), Tailscale also present |
+   | Same connection bound to the Ethernet address | `PermissionError` (WSAEACCES) even for IMAP |
+
+   So the block is the **AmneziaVPN tunnel**: its exit does not carry SMTP, and
+   its kill switch prevents bypassing it. That is a VPN policy — it cannot be
+   changed from inside this application or from Windows Firewall. To send:
+   disconnect the VPN, exclude the application (split tunnelling), or use an
+   exit that permits SMTP. Port 465 is worth trying first; the client now falls
+   back to it automatically.
+
+   Everything up to the socket is covered by the fake-SMTP tests (build, port
+   fallback, TLS choice, login, envelope, Sent copy, error classification), and
+   a blocked send is no longer lost — it lands in the Outbox and goes out when
+   the network allows it.
+2. **Provider quirks on real folders**: Gmail's `[Gmail]/All Mail` duplicates
+   every message (it is a label, not a folder), and Gmail applies its own
+   "delete = move to Trash" semantics. Folder listing is verified against your
+   account; deleting and moving are verified only against the fake server.
+3. **Large mailboxes.** Your Inbox has 104 messages and All Mail 4701; the
+   default cap is 200 newest per folder (Settings → Synchronisation). Sync
+   timing on All Mail is untested.
+4. **`mark_seen = True` is set in your `config.ini`**, so opening a message
+   marks it read on the server. Turn it off in Settings → Accounts if that is
+   not wanted.
+5. **Notifications need a system tray.** Windows provides one, and the toast was
+   exercised through the notification centre in the tests, but whether Windows
+   Focus Assist suppresses the banner on your desktop is yours to confirm.
 
 ### Checking the logs yourself
 
@@ -174,6 +202,37 @@ python main.py --debug
 type logs\mailviewer.log | findstr "\"component\":\"imap\""
 findstr /i "password" logs\mailviewer.log     # must find nothing
 ```
+
+### Multiple accounts, notifications and the outbox
+
+**Several accounts at once.** `config.ini` holds a list of profiles
+(`[account:Personal]`, `[smtp:Personal]`, …); each one gets its own
+`MailStore`, its own `SyncController` and therefore its own IMAP connection and
+thread, so all accounts synchronise in parallel. The folder tree shows one root
+per account, and selecting a folder under another root switches to it. Compose
+has a **From** picker: the chosen account decides which SMTP server is used and
+which Sent folder receives the copy. An old single-account `config.ini` is
+migrated automatically.
+
+**New-mail notifications.** A tray icon carries an unread badge (drawn at
+runtime, no image files) and new mail raises a native toast naming the sender
+and subject; clicking it opens that message. The *first* sync of a folder is
+deliberately silent - loading 200 existing messages is not new mail. Only
+unread arrivals notify, `only_inbox` is on by default, and closing the window
+keeps the client in the tray (the tray menu has a real Quit) so mail can still
+be announced.
+
+**Outbox.** When the server cannot be reached, the message is not lost: it is
+written to `cache/outbox/` as `.eml` + `.json` and retried with exponential
+backoff (1, 2, 4 … minutes, capped at 30, given up after 20 attempts). Only
+*retryable* failures are queued - a wrong password or a rejected recipient is
+reported instead, because retrying would fail identically forever. The status
+bar shows how many messages are waiting.
+
+**SMTP port fallback.** If the configured port times out, the other standard
+pairs are tried automatically (587/STARTTLS → 465/SSL → 25). If none answer, the
+error message includes a probe of all three ports and names the usual causes
+(VPN, ISP, corporate firewall) instead of just reporting a timeout.
 
 ---
 
@@ -202,8 +261,8 @@ permanent, confirmed), move to any folder, mark read/unread, star/unstar, search
 ## 5. Testing
 
 ```bash
-python tests/run_all.py              # 148 tests, ~55 s
-python tests/run_all.py --no-gui     # 122 tests, ~2 s, no windows
+python tests/run_all.py              # 186 tests, ~55 s
+python tests/run_all.py --no-gui     # 146 tests, ~2 s, no windows
 python tests/test_receiver.py -v     # one suite
 python tests/make_samples.py         # regenerate samples/*.eml
 ```
@@ -220,17 +279,23 @@ The suites never touch a real server:
 |---|---|---|
 | `test_parser.py` | 39 | MIME structure, charsets, RFC 2047, attachments, malformed input, HTML sanitising |
 | `test_receiver.py` | 29 | imbox compatibility, search, byte-exact fetch, flags, move/delete, APPEND, folders, UTF-7, error translation |
-| `test_sender.py` | 29 | message building, reply/reply-all/forward, SMTP conversation and failures |
+| `test_sender.py` | 33 | message building, reply/reply-all/forward, SMTP conversation and failures |
 | `test_sync.py` | 18 | incremental sync, dedup, cache, UIDVALIDITY, cancellation, failures |
 | `test_logging.py` | 7 | structured JSON fields, password redaction in messages, args and extras |
-| `test_gui_integration.py` | 26 | the real window against the fake server: startup, sync, flags, delete, search, sort, compose, folders, auth failure |
+| `test_outbox_config.py` | 20 | outbox persistence/backoff/exhaustion, multi-account config round trip and migration |
+| `test_gui_integration.py` | 40 | the real window against the fake server: startup, sync, flags, delete, search, sort, compose, folders, auth failure |
 
 ---
 
 ## 6. Known limitations
 
-* **Send later** is not implemented. It needs a process that outlives the window;
-  a desktop app that is closed cannot send. Drafts are stored on the server instead.
+* **Send later** is not implemented as a scheduler. The Outbox covers the
+  related need (a message that cannot go now is retried automatically), but
+  "send this at 09:00 tomorrow" would need a process that outlives the window.
+* **One notification style.** Toasts go through the system tray; there is no
+  in-app notification list or per-sender rule.
+* **Accounts are independent.** There is no unified inbox across accounts; each
+  account keeps its own folder tree and message list.
 * **Threaded conversation view** is not implemented — messages are listed flat.
   Threading *headers* are written and preserved, so other clients thread the replies.
 * **Server-side search** uses `TEXT "…"`, which most servers implement as a substring

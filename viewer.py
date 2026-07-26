@@ -104,10 +104,18 @@ from html_processor import SanitizedHtml, build_document, sanitize_html, text_to
 from logging_setup import get_logger  # noqa: E402
 from mail_parser import find_inline_attachment, parse_email  # noqa: E402
 from mail_receiver import FILTERS, EmlFileSource, FolderInfo  # noqa: E402
-from mail_sender import Draft, build_forward, build_reply  # noqa: E402
+from mail_sender import (  # noqa: E402
+    Draft,
+    SendError,
+    SmtpSender,
+    build_forward,
+    build_reply,
+)
 from mail_storage import MailStore  # noqa: E402
 from mail_sync import SyncController  # noqa: E402
 from models import Attachment, Email, format_addresses  # noqa: E402
+from notifications import NotificationCenter, make_mail_icon  # noqa: E402
+from outbox import Outbox, QueuedMessage  # noqa: E402
 
 logger = get_logger("ui")
 
@@ -828,9 +836,13 @@ class AttachmentPane(QWidget):
 
 # ------------------------------------------------------------------- folders
 class FolderTree(QTreeWidget):
-    """Mailbox tree with unread counts; emits the raw IMAP name on selection."""
+    """Accounts and their mailboxes, with unread counts.
 
-    folder_selected = Signal(str)
+    Every account is a root node, so several accounts are visible at once and
+    switching between them is just selecting a folder under another root.
+    """
+
+    folder_selected = Signal(str, str)          # account, folder
 
     ICONS = {"inbox": "📥", "sent": "📤", "drafts": "📝", "trash": "🗑",
              "spam": "⚠", "archive": "📦", "all": "🗂", "other": "📁"}
@@ -838,44 +850,85 @@ class FolderTree(QTreeWidget):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setHeaderHidden(True)
-        self.setMinimumWidth(180)
+        self.setMinimumWidth(200)
         self.setRootIsDecorated(True)
-        self._items: dict[str, QTreeWidgetItem] = {}
+        self._accounts: dict[str, QTreeWidgetItem] = {}
+        self._items: dict[tuple[str, str], QTreeWidgetItem] = {}
+        self._single_account = True
         self.itemSelectionChanged.connect(self._on_selection)
 
-    def set_folders(self, folders: Sequence[FolderInfo]) -> None:
-        current = self.current_folder()
-        self.clear()
-        self._items.clear()
+    # ------------------------------------------------------------- accounts
+    def set_accounts(self, names: Sequence[str]) -> None:
+        """Create (or prune) the root node of every configured account."""
+        self._single_account = len(names) <= 1
+        for name in names:
+            if name not in self._accounts:
+                item = QTreeWidgetItem([f"👤  {name}"])
+                item.setData(0, Qt.UserRole, "")
+                item.setData(0, Qt.UserRole + 1, name)
+                font = item.font(0)
+                font.setBold(True)
+                item.setFont(0, font)
+                self.addTopLevelItem(item)
+                item.setExpanded(True)
+                self._accounts[name] = item
+            self._accounts[name].setHidden(self._single_account)
 
-        # Special folders first, then the rest, nested on the delimiter.
+        for name in list(self._accounts):
+            if name not in names:
+                index = self.indexOfTopLevelItem(self._accounts[name])
+                if index >= 0:
+                    self.takeTopLevelItem(index)
+                del self._accounts[name]
+                for key in [k for k in self._items if k[0] == name]:
+                    del self._items[key]
+
+    def set_folders(self, account: str, folders: Sequence[FolderInfo]) -> None:
+        """Fill one account's subtree, keeping the current selection."""
+        current = self.current_target()
+        root = self._accounts.get(account)
+        if root is None:
+            self.set_accounts([account])
+            root = self._accounts[account]
+
+        root.takeChildren()
+        for key in [k for k in self._items if k[0] == account]:
+            del self._items[key]
+
         for folder in folders:
-            parent_item: Optional[QTreeWidgetItem] = None
+            parent_item = root
             parts = folder.name.split(folder.delimiter) if folder.delimiter else [folder.name]
             path = ""
             for depth, part in enumerate(parts):
                 path = f"{path}{folder.delimiter}{part}" if path else part
-                item = self._items.get(path)
+                key = (account, path)
+                item = self._items.get(key)
                 if item is None:
                     item = QTreeWidgetItem([part])
-                    if parent_item is None:
-                        self.addTopLevelItem(item)
-                    else:
-                        parent_item.addChild(item)
-                    self._items[path] = item
+                    parent_item.addChild(item)
+                    self._items[key] = item
                     item.setData(0, Qt.UserRole, path if depth == len(parts) - 1 else "")
+                    item.setData(0, Qt.UserRole + 1, account)
                 parent_item = item
 
-            item = self._items[folder.name]
+            item = self._items[(account, folder.name)]
             item.setData(0, Qt.UserRole, folder.name if folder.selectable else "")
-            item.setText(0, f"{self.ICONS.get(folder.kind, '📁')}  {folder.display}")
+            item.setData(0, Qt.UserRole + 1, account)
             self._update_count(item, folder.display, folder.kind, folder.unread)
-            item.setToolTip(0, f"{folder.name}\n{folder.total} message(s), "
-                               f"{folder.unread} unread")
+            item.setToolTip(0, f"{account} · {folder.name}\n"
+                               f"{folder.total} message(s), {folder.unread} unread")
 
+        # Top-level folders when there is only one account, nested otherwise.
+        root.setHidden(self._single_account)
+        if self._single_account:
+            children = root.takeChildren()
+            for child in children:
+                self.addTopLevelItem(child)
+                child.setExpanded(True)
         self.expandAll()
-        if current:
-            self.select_folder(current)
+
+        if current[1]:
+            self.select_folder(*current)
 
     def _update_count(self, item: QTreeWidgetItem, display: str, kind: str, unread: int) -> None:
         icon = self.ICONS.get(kind, "📁")
@@ -884,46 +937,60 @@ class FolderTree(QTreeWidget):
         item.setFont(0, font)
         item.setText(0, f"{icon}  {display}" + (f"  ({unread})" if unread else ""))
 
-    def update_unread(self, folder: str, unread: int, display: str = "", kind: str = "") -> None:
-        item = self._items.get(folder)
+    def update_unread(self, account: str, folder: str, unread: int,
+                      display: str = "", kind: str = "") -> None:
+        item = self._items.get((account, folder))
         if item is None:
             return
         text = display or item.text(0).split("  ", 1)[-1].split("  (")[0]
         self._update_count(item, text, kind or "other", unread)
 
-    def current_folder(self) -> str:
+    def set_account_unread(self, account: str, unread: int) -> None:
+        item = self._accounts.get(account)
+        if item is None:
+            return
+        item.setText(0, f"👤  {account}" + (f"  ({unread})" if unread else ""))
+
+    # ------------------------------------------------------------ selection
+    def current_target(self) -> tuple[str, str]:
         items = self.selectedItems()
         if not items:
-            return ""
-        return str(items[0].data(0, Qt.UserRole) or "")
+            return ("", "")
+        item = items[0]
+        return (str(item.data(0, Qt.UserRole + 1) or ""), str(item.data(0, Qt.UserRole) or ""))
 
-    def select_folder(self, folder: str) -> None:
-        item = self._items.get(folder)
+    def select_folder(self, account: str, folder: str) -> None:
+        item = self._items.get((account, folder))
         if item is not None:
             self.setCurrentItem(item)
 
     def _on_selection(self) -> None:
-        folder = self.current_folder()
+        account, folder = self.current_target()
         if folder:
-            self.folder_selected.emit(folder)
+            self.folder_selected.emit(account, folder)
 
 
 # ------------------------------------------------------------- file loading
 class FileLoadWorker(QObject):
     """Parses ``.eml`` files off the UI thread (kept from the viewer version)."""
 
-    message_ready = Signal(object)
+    #: account, Email - the account keeps the signature identical to the sync
+    #: worker's, so the window can connect a bound method (never a lambda,
+    #: which Qt would deliver directly on this thread).
+    message_ready = Signal(str, object)
     finished = Signal(int, str)
 
-    def __init__(self, paths: list[str]) -> None:
+    def __init__(self, paths: list[str], account: str = "") -> None:
         super().__init__()
         self._paths = paths
+        self._account = account
 
     def run(self) -> None:
         count, error = 0, ""
         try:
             for raw in EmlFileSource.read(self._paths):
                 self.message_ready.emit(
+                    self._account,
                     parse_email(raw.raw, uid=raw.uid, source=raw.folder, folder="(files)")
                 )
                 count += 1
@@ -931,6 +998,43 @@ class FileLoadWorker(QObject):
             logger.exception("Failed to load .eml files")
             error = str(exc)
         self.finished.emit(count, error)
+
+
+class OutboxWorker(QObject):
+    """Retries queued messages off the UI thread."""
+
+    item_sent = Signal(object, object)      # QueuedMessage, SendResult
+    item_failed = Signal(object, str, bool)  # QueuedMessage, error, retryable
+    finished = Signal(int, int)             # sent, failed
+
+    def __init__(self, settings: AppSettings, items: Sequence[QueuedMessage]) -> None:
+        super().__init__()
+        self._settings = settings
+        self._items = list(items)
+
+    def run(self) -> None:
+        sent = failed = 0
+        for item in self._items:
+            profile = self._settings.find_profile(item.account) or self._settings.profile
+            smtp = self._settings.smtp_settings(profile)
+            if not smtp.is_complete:
+                self.item_failed.emit(item, "Sending is not configured for this account.", False)
+                failed += 1
+                continue
+            try:
+                result = SmtpSender(smtp).send_raw(
+                    item.raw, item.sender, item.recipients, item.message_id
+                )
+                sent += 1
+                self.item_sent.emit(item, result)
+            except SendError as exc:
+                failed += 1
+                self.item_failed.emit(item, str(exc), exc.retryable)
+            except Exception as exc:  # a bug must not kill the thread
+                logger.exception("Unexpected error while retrying a queued message")
+                failed += 1
+                self.item_failed.emit(item, f"Unexpected error: {exc}", True)
+        self.finished.emit(sent, failed)
 
 
 # ----------------------------------------------------------------- main window
@@ -941,22 +1045,27 @@ class MainWindow(QMainWindow):
         #: True when the window was opened on local files: do not ask for an
         #: account and do not start synchronising.
         self._start_offline = start_offline
-        self._store = MailStore(
-            cache_dir=settings.sync.cache_path() if settings.sync.cache_enabled else None,
-            account_key=settings.account_key(),
-            cache_enabled=settings.sync.cache_enabled,
-            max_messages_per_folder=settings.sync.max_messages_per_folder,
-        )
-        self._folders: dict[str, FolderInfo] = {}
+
+        self._stores: dict[str, MailStore] = {}
+        self._controllers: dict[str, SyncController] = {}
+        self._folders: dict[str, dict[str, FolderInfo]] = {}
+        self._current_account = settings.profile.name
         self._current_folder = settings.account.folder or "INBOX"
         self._current: Optional[Email] = None
         self._allow_remote_for_current = settings.allow_remote_images
         self._compose_windows: list[QWidget] = []
         self._file_thread: Optional[QThread] = None
         self._file_worker: Optional[QObject] = None
-        self._syncing = False
+        self._outbox_thread: Optional[QThread] = None
+        self._outbox_worker: Optional[OutboxWorker] = None
+        self._syncing: set[str] = set()
+        self._quitting = False
+        self._tray_hint_shown = False
+
+        self._outbox = Outbox(settings.outbox_path())
 
         self.setWindowTitle(APP_NAME)
+        self.setWindowIcon(make_mail_icon(0))
         self._restore_geometry()
 
         self._model = MessageListModel(self)
@@ -968,14 +1077,84 @@ class MainWindow(QMainWindow):
         self._build_central()
         self._build_status_bar()
 
-        self._controller = SyncController(settings.account, self._store, settings, self)
-        self._connect_worker()
-        if start_offline:
-            # Opened on local files: never reach for the server on a timer.
-            self._controller.apply_interval(0)
+        self._notifications = NotificationCenter(settings, self)
+        self._notifications.open_requested.connect(self._restore_from_tray)
+        self._notifications.sync_requested.connect(self.sync_all)
+        self._notifications.quit_requested.connect(self.quit_application)
+        self._notifications.message_activated.connect(self._open_notified_message)
 
+        self._outbox_timer = QTimer(self)
+        self._outbox_timer.timeout.connect(self.retry_outbox)
+        interval = max(30, settings.sync.outbox_retry_seconds)
+        self._outbox_timer.start(interval * 1000)
+
+        self._create_controllers()
         self.statusBar().showMessage(f"Ready · rendering with {self._body.backend}")
         QTimer.singleShot(0, self._start_up)
+
+    # ------------------------------------------------------------- accounts
+    def _create_controllers(self) -> None:
+        """One store and one sync thread per configured account."""
+        for profile in self._settings.profiles:
+            if profile.name in self._controllers:
+                continue
+            store = MailStore(
+                cache_dir=(self._settings.sync.cache_path()
+                           if self._settings.sync.cache_enabled else None),
+                account_key=profile.key,
+                cache_enabled=self._settings.sync.cache_enabled,
+                max_messages_per_folder=self._settings.sync.max_messages_per_folder,
+            )
+            controller = SyncController(profile.account, store, self._settings, self,
+                                        name=profile.name)
+            self._stores[profile.name] = store
+            self._folders.setdefault(profile.name, {})
+            self._controllers[profile.name] = controller
+            self._connect_controller(profile.name, controller)
+        self._folder_tree.set_accounts([p.name for p in self._settings.profiles])
+
+    def _drop_controller(self, name: str) -> None:
+        controller = self._controllers.pop(name, None)
+        if controller is not None:
+            controller.shutdown()
+            controller.deleteLater()
+        self._stores.pop(name, None)
+        self._folders.pop(name, None)
+        self._notifications.forget(name)
+
+    def _connect_controller(self, name: str, controller: SyncController) -> None:
+        """Wire one account's worker.
+
+        Bound methods on purpose: a lambda would give Qt no receiver object, so
+        the connection would be *direct* and these handlers would run inside the
+        sync thread - touching widgets from the wrong thread.  The worker puts
+        the account name in every signal so no closure is needed.
+        """
+        worker = controller.worker
+        worker.folders_listed.connect(self._on_folders)
+        worker.message_arrived.connect(self._on_message_arrived)
+        worker.flags_changed.connect(self._on_flags_changed)
+        worker.messages_removed.connect(self._on_messages_removed)
+        worker.sync_started.connect(self._on_sync_started)
+        worker.sync_progress.connect(self._on_sync_progress)
+        worker.sync_finished.connect(self._on_sync_finished)
+        worker.operation_finished.connect(self._on_operation_finished)
+        worker.connection_changed.connect(self._on_connection_changed)
+        worker.cache_loaded.connect(self._on_cache_loaded)
+
+    def store(self, account: Optional[str] = None) -> MailStore:
+        name = account or self._current_account
+        if name not in self._stores:
+            self._stores[name] = MailStore(cache_enabled=False)
+        return self._stores[name]
+
+    def controller(self, account: Optional[str] = None) -> Optional[SyncController]:
+        return self._controllers.get(account or self._current_account)
+
+    @property
+    def current_profile(self):
+        return (self._settings.find_profile(self._current_account)
+                or self._settings.profile)
 
     # ---------------------------------------------------------------- set-up
     def _restore_geometry(self) -> None:
@@ -997,9 +1176,15 @@ class MainWindow(QMainWindow):
         self._sync_action.triggered.connect(self.sync_now)
         toolbar.addAction(self._sync_action)
 
+        self._sync_all_action = QAction("Sync all", self)
+        self._sync_all_action.setShortcut(QKeySequence("Shift+F5"))
+        self._sync_all_action.setToolTip("Synchronise every account")
+        self._sync_all_action.triggered.connect(self.sync_all)
+        toolbar.addAction(self._sync_all_action)
+
         self._stop_action = QAction("Stop", self)
         self._stop_action.setEnabled(False)
-        self._stop_action.triggered.connect(lambda: self._controller.stop_current())
+        self._stop_action.triggered.connect(self.stop_sync)
         toolbar.addAction(self._stop_action)
         toolbar.addSeparator()
 
@@ -1181,7 +1366,7 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(1, 0)
         self._splitter.setStretchFactor(2, 1)
         sizes = self._settings.window.sizes()
-        self._splitter.setSizes(sizes if len(sizes) == 3 else [200, 330, 720])
+        self._splitter.setSizes(sizes if len(sizes) == 3 else [220, 330, 720])
         self.setCentralWidget(self._splitter)
 
     def _build_status_bar(self) -> None:
@@ -1190,103 +1375,127 @@ class MainWindow(QMainWindow):
         self._progress.setMaximumWidth(160)
         self._progress.setMaximumHeight(14)
         self._progress.hide()
+        self._outbox_label = QLabel("")
+        self._outbox_label.setToolTip("Messages waiting to be sent")
+        _dim(self._outbox_label)
         self._unread_label = QLabel("")
         self._sync_label = QLabel("Idle")
         _dim(self._sync_label)
         bar.addPermanentWidget(self._progress)
+        bar.addPermanentWidget(self._outbox_label)
         bar.addPermanentWidget(self._unread_label)
         bar.addPermanentWidget(self._sync_label)
-
-    def _connect_worker(self) -> None:
-        worker = self._controller.worker
-        worker.folders_listed.connect(self._on_folders)
-        worker.message_arrived.connect(self._on_message_arrived)
-        worker.flags_changed.connect(self._on_flags_changed)
-        worker.messages_removed.connect(self._on_messages_removed)
-        worker.sync_started.connect(self._on_sync_started)
-        worker.sync_progress.connect(self._on_sync_progress)
-        worker.sync_finished.connect(self._on_sync_finished)
-        worker.operation_finished.connect(self._on_operation_finished)
-        worker.connection_changed.connect(self._on_connection_changed)
-        worker.cache_loaded.connect(
-            lambda folder, count: self.statusBar().showMessage(
-                f"{count} message(s) restored from the local cache", 5000) if count else None
-        )
+        self._update_outbox_label()
 
     def _start_up(self) -> None:
         if self._start_offline:
             self.statusBar().showMessage("Opened local files · not connected", 8000)
             return
-        account = self._settings.account
-        if not account.username or not account.password:
+        if not self._settings.enabled_profiles():
             self.statusBar().showMessage("No account configured - open Settings…")
             self.open_settings()
-            account = self._settings.account
-            if not account.username or not account.password:
+            if not self._settings.enabled_profiles():
                 return
-        self._controller.set_target(self._current_folder, self._filter.currentData())
-        self._controller.list_folders()
-        self._controller.load_cache(self._current_folder,
-                                    self._settings.sync.max_messages_per_folder)
-        if self._settings.sync.sync_on_start:
-            self._controller.sync_now(self._current_folder, self._filter.currentData())
+
+        for profile in self._settings.enabled_profiles():
+            controller = self.controller(profile.name)
+            if controller is None:
+                continue
+            folder = (profile.account.folder or "INBOX") if profile.name != self._current_account \
+                else self._current_folder
+            controller.set_target(folder, self._filter.currentData())
+            controller.list_folders()
+            if profile.name == self._current_account:
+                controller.load_cache(folder, self._settings.sync.max_messages_per_folder)
+            if self._settings.sync.sync_on_start:
+                controller.sync_now(folder, self._filter.currentData())
+        self.retry_outbox()
 
     # -------------------------------------------------------------- folders
-    def _on_folders(self, folders: Sequence[FolderInfo]) -> None:
-        self._folders = {folder.name: folder for folder in folders}
-        self._folder_tree.set_folders(folders)
-        if self._current_folder not in self._folders and folders:
-            inbox = next((f for f in folders if f.kind == "inbox"), folders[0])
-            self._current_folder = inbox.name
-        self._folder_tree.select_folder(self._current_folder)
-        self._update_unread_label()
+    def _on_folders(self, account: str, folders: Sequence[FolderInfo]) -> None:
+        self._folders[account] = {folder.name: folder for folder in folders}
+        self._folder_tree.set_folders(account, folders)
+        if account == self._current_account and self._current_folder not in self._folders[account]:
+            inbox = next((f for f in folders if f.kind == "inbox"), folders[0] if folders else None)
+            if inbox is not None:
+                self._current_folder = inbox.name
+        self._folder_tree.select_folder(self._current_account, self._current_folder)
+        self._update_unread()
 
-    def open_folder(self, folder: str) -> None:
-        if not folder or folder == self._current_folder:
+    def open_folder(self, account: str, folder: str) -> None:
+        if not folder:
             return
-        logger.info("Opening folder %s", folder, extra={"event": "open_folder", "folder": folder})
-        self._current_folder = folder
-        self._current = None
-        self._model.set_messages(self._store.messages(folder))
-        self._render_current()
-        self._controller.set_target(folder, self._filter.currentData())
-        self._controller.load_cache(folder, self._settings.sync.max_messages_per_folder)
-        self._controller.sync_now(folder, self._filter.currentData())
-        self._select_first_row()
+        if account == self._current_account and folder == self._current_folder:
+            return
+        logger.info("Opening %s / %s", account, folder,
+                    extra={"event": "open_folder", "account": account, "folder": folder})
 
-    def _folder_of_kind(self, kind: str) -> Optional[str]:
-        for folder in self._folders.values():
+        switched_account = account != self._current_account
+        self._current_account = account or self._current_account
+        self._current_folder = folder
+        if switched_account:
+            self._settings.active_profile = self._current_account
+            self.setWindowTitle(f"{APP_NAME} — {self._current_account}")
+
+        self._current = None
+        self._model.set_messages(self.store().messages(folder))
+        self._render_current()
+
+        controller = self.controller()
+        if controller is not None:
+            controller.set_target(folder, self._filter.currentData())
+            controller.load_cache(folder, self._settings.sync.max_messages_per_folder)
+            controller.sync_now(folder, self._filter.currentData())
+        self._select_first_row()
+        self._update_unread()
+
+    def _folder_of_kind(self, kind: str, account: Optional[str] = None) -> Optional[str]:
+        for folder in self._folders.get(account or self._current_account, {}).values():
             if folder.kind == kind:
                 return folder.name
         return None
 
     # ------------------------------------------------------------- syncing
     def sync_now(self) -> None:
-        self._controller.sync_now(self._current_folder, self._filter.currentData())
+        controller = self.controller()
+        if controller is not None:
+            controller.sync_now(self._current_folder, self._filter.currentData())
 
-    def _on_sync_started(self, folder: str) -> None:
-        self._syncing = True
-        self._sync_label.setText(f"⟳ Syncing {folder}…")
+    def sync_all(self) -> None:
+        for name, controller in self._controllers.items():
+            folder = (self._current_folder if name == self._current_account
+                      else (self._settings.find_profile(name).account.folder or "INBOX"))
+            controller.sync_now(folder, self._filter.currentData())
+
+    def stop_sync(self) -> None:
+        for controller in self._controllers.values():
+            controller.stop_current()
+
+    def _on_sync_started(self, account: str, folder: str) -> None:
+        self._syncing.add(account)
+        self._sync_label.setText(f"⟳ Syncing {account}/{folder}…")
         self._stop_action.setEnabled(True)
         self._progress.setRange(0, 0)
         self._progress.show()
 
-    def _on_sync_progress(self, done: int, total: int) -> None:
+    def _on_sync_progress(self, account: str, done: int, total: int) -> None:
         if total > 0:
             self._progress.setRange(0, total)
             self._progress.setValue(done)
         self.statusBar().showMessage(f"Downloading {done}/{total}…")
 
-    def _on_sync_finished(self, result) -> None:
-        self._syncing = False
-        self._stop_action.setEnabled(False)
-        self._progress.hide()
+    def _on_sync_finished(self, account: str, result) -> None:
+        self._syncing.discard(account)
+        if not self._syncing:
+            self._stop_action.setEnabled(False)
+            self._progress.hide()
+
         from datetime import datetime
 
         stamp = datetime.now().strftime("%H:%M:%S")
         if result.error:
-            self._sync_label.setText(f"⚠ Sync failed at {stamp}")
-            self.statusBar().showMessage(result.error, 15000)
+            self._sync_label.setText(f"⚠ {account}: sync failed at {stamp}")
+            self.statusBar().showMessage(f"{account}: {result.error}", 15000)
         else:
             self._sync_label.setText(f"Last sync {stamp}")
             summary = []
@@ -1297,17 +1506,37 @@ class MainWindow(QMainWindow):
             if result.removed_uids:
                 summary.append(f"{len(result.removed_uids)} removed")
             self.statusBar().showMessage(
-                f"Sync of {result.folder}: " + (", ".join(summary) or "no changes"), 8000
+                f"{account}/{result.folder}: " + (", ".join(summary) or "no changes"), 8000
             )
-            folder = self._folders.get(result.folder)
+            folders = self._folders.get(account, {})
+            folder = folders.get(result.folder)
             if folder is not None:
                 folder.unread = result.unread
                 folder.total = result.total
-                self._folder_tree.update_unread(result.folder, result.unread,
+                self._folder_tree.update_unread(account, result.folder, result.unread,
                                                 folder.display, folder.kind)
-        self._update_unread_label()
+            self._maybe_notify(account, result)
+        self._update_unread()
 
-    def _on_message_arrived(self, mail: Email) -> None:
+    def _maybe_notify(self, account: str, result) -> None:
+        """Toast for genuinely new, unread mail - never on the first pass."""
+        first_pass = self._notifications.prime(account, result.folder)
+        if first_pass or not result.new_messages:
+            return
+        fresh = [mail for mail in result.new_messages if not mail.is_read]
+        if not fresh:
+            return
+        fresh.sort(key=lambda mail: mail.sort_key, reverse=True)
+        self._notifications.notify_new_messages(account, result.folder, fresh)
+
+    def _on_cache_loaded(self, account: str, folder: str, count: int) -> None:
+        if count:
+            self.statusBar().showMessage(
+                f"{count} message(s) restored from the local cache", 5000)
+
+    def _on_message_arrived(self, account: str, mail: Email) -> None:
+        if account != self._current_account and mail.folder != "(files)":
+            return
         if mail.folder != self._current_folder and mail.folder != "(files)":
             return
         scrollbar = self._list_view.verticalScrollBar()
@@ -1325,43 +1554,64 @@ class MainWindow(QMainWindow):
             self._reselect(selected)
         elif self._current is None and self._model.rowCount() == 1:
             self._select_first_row()
-        self._update_unread_label()
+        self._update_unread()
 
-    def _on_flags_changed(self, folder: str, uid: int, flags) -> None:
-        if folder != self._current_folder:
+    def _on_flags_changed(self, account: str, folder: str, uid: int, flags) -> None:
+        if account != self._current_account or folder != self._current_folder:
+            self._update_unread()
             return
         self._model.refresh_uid(str(uid))
         if self._current is not None and self._current.uid == str(uid):
             self._star_action.setChecked(self._current.is_starred)
-        self._update_unread_label()
+        self._update_unread()
 
-    def _on_messages_removed(self, folder: str, uids: Sequence[int]) -> None:
-        if folder != self._current_folder:
+    def _on_messages_removed(self, account: str, folder: str, uids: Sequence[int]) -> None:
+        if account != self._current_account or folder != self._current_folder:
+            self._update_unread()
             return
         removing_current = self._current is not None and self._current.uid_number in set(uids)
         self._model.remove_uids(list(uids))
         if removing_current:
             self._current = None
             self._select_first_row()
-        self._update_unread_label()
+        self._update_unread()
 
-    def _on_operation_finished(self, operation: str, ok: bool, message: str) -> None:
+    def _on_operation_finished(self, account: str, operation: str, ok: bool,
+                               message: str) -> None:
         if message:
-            self.statusBar().showMessage(message, 8000)
+            self.statusBar().showMessage(f"{account}: {message}" if len(self._controllers) > 1
+                                         else message, 8000)
         if not ok:
-            logger.warning("Operation %s failed: %s", operation, message)
+            logger.warning("Operation %s failed for %s: %s", operation, account, message)
             if operation in ("delete", "flags", "move", "append", "search"):
-                QMessageBox.warning(self, APP_NAME, f"{operation.capitalize()} failed:\n{message}")
+                QMessageBox.warning(self, APP_NAME,
+                                    f"{operation.capitalize()} failed for {account}:\n{message}")
 
-    def _on_connection_changed(self, connected: bool, message: str) -> None:
-        self._sync_label.setText("Connected" if connected else "Disconnected")
-        if not connected and message:
-            self.statusBar().showMessage(message, 15000)
+    def _on_connection_changed(self, account: str, connected: bool, message: str) -> None:
+        if connected:
+            self._sync_label.setText(f"{account}: connected")
+        else:
+            self._sync_label.setText(f"{account}: disconnected")
+            if message:
+                self.statusBar().showMessage(f"{account}: {message}", 15000)
 
-    def _update_unread_label(self) -> None:
-        total, unread = self._store.counts(self._current_folder)
+    def _update_unread(self) -> None:
+        """Status bar counters, folder-tree totals and the tray badge."""
+        total, unread = self.store().counts(self._current_folder)
         shown = self._proxy.rowCount()
         self._unread_label.setText(f"{shown}/{total} shown · {unread} unread")
+
+        per_account: dict[str, int] = {}
+        for name in self._controllers:
+            folders = self._folders.get(name, {})
+            if folders:
+                count = sum(f.unread for f in folders.values()
+                            if f.kind in ("inbox", "other", "archive"))
+            else:
+                count = self.store(name).counts("INBOX")[1]
+            per_account[name] = count
+            self._folder_tree.set_account_unread(name, count)
+        self._notifications.set_unread(sum(per_account.values()), per_account)
 
     # ------------------------------------------------------------ selection
     def _select_first_row(self) -> None:
@@ -1399,6 +1649,19 @@ class MainWindow(QMainWindow):
             self._star_action.setChecked(mail.is_starred)
             if self._settings.mark_seen and not mail.is_read and mail.uid_number:
                 self.set_read(True)
+
+    def _open_notified_message(self, account: str, folder: str, uid: str) -> None:
+        """Clicking a notification opens exactly that message."""
+        if not uid:
+            return
+        if account and (account != self._current_account or folder != self._current_folder):
+            self._folder_tree.select_folder(account, folder)
+            self.open_folder(account, folder)
+        row = self._model.row_for_uid(uid)
+        if row >= 0:
+            proxy_index = self._proxy.mapFromSource(self._model.index(row, 0))
+            if proxy_index.isValid():
+                self._list_view.setCurrentIndex(proxy_index)
 
     def _render_current(self) -> None:
         mail = self._current
@@ -1451,7 +1714,7 @@ class MainWindow(QMainWindow):
         menu.addAction("Toggle star", self.toggle_star)
         menu.addSeparator()
         move_menu = menu.addMenu("Move to")
-        for folder in self._folders.values():
+        for folder in self._folders.get(self._current_account, {}).values():
             if folder.selectable and folder.name != self._current_folder:
                 move_menu.addAction(folder.display,
                                     lambda checked=False, name=folder.name: self.move_to(name))
@@ -1460,28 +1723,32 @@ class MainWindow(QMainWindow):
 
     def set_read(self, read: bool) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
-        if not messages:
+        controller = self.controller()
+        if not messages or controller is None:
             return
-        uids = [m.uid_number for m in messages]
-        self._controller.set_flags(self._current_folder, uids, ["\\Seen"], add=read)
+        controller.set_flags(self._current_folder, [m.uid_number for m in messages],
+                             ["\\Seen"], add=read)
 
     def toggle_star(self) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
-        if not messages:
+        controller = self.controller()
+        if not messages or controller is None:
             return
         add = not all(m.is_starred for m in messages)
-        self._controller.set_flags(self._current_folder,
-                                   [m.uid_number for m in messages], ["\\Flagged"], add=add)
+        controller.set_flags(self._current_folder, [m.uid_number for m in messages],
+                             ["\\Flagged"], add=add)
 
     def move_to(self, destination: str) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
-        if not messages:
+        controller = self.controller()
+        if not messages or controller is None:
             return
-        self._controller.move(self._current_folder, [m.uid_number for m in messages], destination)
+        controller.move(self._current_folder, [m.uid_number for m in messages], destination)
 
     def delete_selected(self) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
-        if not messages:
+        controller = self.controller()
+        if not messages or controller is None:
             return
         trash = self._folder_of_kind("trash")
         in_trash = self._current_folder == trash
@@ -1515,22 +1782,22 @@ class MainWindow(QMainWindow):
         if self._current is not None and self._current.uid_number in set(uids):
             self._current = None
             self._render_current()
-        self._controller.delete(self._current_folder, uids, permanent=permanent)
+        controller.delete(self._current_folder, uids, permanent=permanent)
         logger.info("Delete requested for %d message(s)", len(uids),
-                    extra={"event": "delete_request", "folder": self._current_folder,
-                           "count": len(uids), "permanent": permanent})
+                    extra={"event": "delete_request", "account": self._current_account,
+                           "folder": self._current_folder, "count": len(uids),
+                           "permanent": permanent})
 
     # --------------------------------------------------------------- compose
-    def _identity(self) -> tuple[str, str]:
-        smtp = self._settings.smtp_settings()
-        return smtp.username or self._settings.account.username, smtp.from_name
-
     def _open_compose(self, draft: Optional[Draft]) -> None:
         from compose_window import ComposeWindow
 
-        window = ComposeWindow(self._settings, draft, self)
-        window.message_sent.connect(self._on_message_sent)
-        window.draft_saved.connect(self._on_draft_saved)
+        window = ComposeWindow(self._settings, draft, self,
+                               account=self._current_account)
+        window.message_sent.connect(
+            lambda result, w=window: self._on_message_sent(w, result))
+        window.draft_saved.connect(lambda raw, w=window: self._on_draft_saved(w, raw))
+        window.message_queued.connect(self._on_message_queued)
         window.setAttribute(Qt.WA_DeleteOnClose, True)
         window.destroyed.connect(lambda: self._compose_windows.remove(window)
                                  if window in self._compose_windows else None)
@@ -1538,66 +1805,161 @@ class MainWindow(QMainWindow):
         window.show()
 
     def compose_new(self) -> None:
-        address, name = self._identity()
-        self._open_compose(Draft(from_address=address, from_name=name))
+        profile = self.current_profile
+        self._open_compose(Draft(from_address=profile.account.username,
+                                 from_name=profile.smtp.from_name))
 
     def reply(self, all_recipients: bool = False) -> None:
         if self._current is None:
             return
-        address, name = self._identity()
-        draft = build_reply(self._current, address, name, reply_all=all_recipients)
+        profile = self.current_profile
+        draft = build_reply(self._current, profile.account.username,
+                            profile.smtp.from_name, reply_all=all_recipients)
         self._open_compose(draft)
 
     def forward(self, as_attachment: bool = False) -> None:
         if self._current is None:
             return
-        address, name = self._identity()
+        profile = self.current_profile
         raw = None
         if as_attachment:
-            raw = self._store.cached_raw(self._current_folder, self._current.uid_number)
+            raw = self.store().cached_raw(self._current_folder, self._current.uid_number)
             if raw is None:
                 self.statusBar().showMessage(
                     "The original bytes are not cached; forwarding a rebuilt copy.", 8000
                 )
-        draft = build_forward(self._current, address, name,
+        draft = build_forward(self._current, profile.account.username,
+                              profile.smtp.from_name,
                               as_attachment=as_attachment, raw_message=raw)
         self._open_compose(draft)
 
-    def _on_message_sent(self, result) -> None:
+    def _account_for_compose(self, window) -> str:
+        name = getattr(window, "selected_account", lambda: "")() or self._current_account
+        return name if name in self._controllers else self._current_account
+
+    def _on_message_sent(self, window, result) -> None:
+        account = self._account_for_compose(window)
         self.statusBar().showMessage(
             f"Message sent to {len(result.recipients)} recipient(s)", 8000
         )
-        sent_folder = self._folder_of_kind("sent")
-        if sent_folder and result is not None:
-            self._controller.append(sent_folder, result.raw, ["\\Seen"])
+        self._notifications.notify("Message sent",
+                                   f"Delivered to {len(result.recipients)} recipient(s)")
+        sent_folder = self._folder_of_kind("sent", account)
+        controller = self.controller(account)
+        if sent_folder and controller is not None and result is not None:
+            controller.append(sent_folder, result.raw, ["\\Seen"])
 
-    def _on_draft_saved(self, raw: bytes) -> None:
-        drafts = self._folder_of_kind("drafts")
-        if not drafts:
+    def _on_draft_saved(self, window, raw: bytes) -> None:
+        account = self._account_for_compose(window)
+        drafts = self._folder_of_kind("drafts", account)
+        controller = self.controller(account)
+        if not drafts or controller is None:
             QMessageBox.information(self, APP_NAME,
                                     "No Drafts folder was found on the server.")
             return
-        self._controller.append(drafts, raw, ["\\Draft"])
+        controller.append(drafts, raw, ["\\Draft"])
+
+    # ---------------------------------------------------------------- outbox
+    def _on_message_queued(self, payload: dict) -> None:
+        """A send failed with a retryable error: keep the message and retry."""
+        item = self._outbox.add(
+            raw=payload.get("raw", b""),
+            sender=payload.get("sender", ""),
+            recipients=payload.get("recipients", []),
+            account=payload.get("account") or self._current_account,
+            subject=payload.get("subject", ""),
+            message_id=payload.get("message_id", ""),
+            error=payload.get("error", ""),
+        )
+        self._update_outbox_label()
+        self._notifications.notify(
+            "Message queued",
+            f"“{item.subject or '(no subject)'}” could not be sent yet and will be retried."
+        )
+
+    def retry_outbox(self) -> None:
+        if self._outbox_thread is not None or self._start_offline:
+            return
+        items = self._outbox.due()
+        if not items:
+            self._update_outbox_label()
+            return
+
+        logger.info("Retrying %d queued message(s)", len(items),
+                    extra={"event": "outbox_retry", "count": len(items)})
+        self.statusBar().showMessage(f"Retrying {len(items)} queued message(s)…", 5000)
+
+        thread = QThread(self)
+        worker = OutboxWorker(self._settings, items)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.item_sent.connect(self._on_queued_sent)
+        worker.item_failed.connect(self._on_queued_failed)
+        worker.finished.connect(self._on_outbox_finished)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._outbox_thread, self._outbox_worker = thread, worker
+        thread.start()
+
+    def _on_queued_sent(self, item, result) -> None:
+        self._outbox.remove(item)
+        sent_folder = self._folder_of_kind("sent", item.account)
+        controller = self.controller(item.account)
+        if sent_folder and controller is not None:
+            controller.append(sent_folder, result.raw, ["\\Seen"])
+        self._notifications.notify(
+            "Queued message sent", f"“{item.subject or '(no subject)'}” has gone out."
+        )
+
+    def _on_queued_failed(self, item, error: str, retryable: bool) -> None:
+        if not retryable:
+            self._outbox.remove(item)
+            QMessageBox.warning(
+                self, APP_NAME,
+                f"“{item.subject or '(no subject)'}” cannot be sent and was removed "
+                f"from the outbox:\n\n{error}",
+            )
+            return
+        self._outbox.record_failure(item, error)
+        if item.exhausted:
+            self._notifications.notify(
+                "Message still not sent",
+                f"“{item.subject or '(no subject)'}” failed {item.attempts} times.",
+            )
+
+    def _on_outbox_finished(self, sent: int, failed: int) -> None:
+        self._outbox_thread, self._outbox_worker = None, None
+        self._update_outbox_label()
+        if sent:
+            self.statusBar().showMessage(f"{sent} queued message(s) sent", 8000)
+
+    def _update_outbox_label(self) -> None:
+        count = self._outbox.count()
+        self._outbox_label.setText(f"📤 {count} queued" if count else "")
 
     # ---------------------------------------------------------------- search
     def _on_search_changed(self, text: str) -> None:
         self._proxy.set_query(text)
-        self._update_unread_label()
+        self._update_unread()
 
     def search_on_server(self) -> None:
         query = self._search.text().strip()
-        if not query:
+        controller = self.controller()
+        if not query or controller is None:
             self.statusBar().showMessage("Type something to search for first", 5000)
             return
         self.statusBar().showMessage(f"Searching the server for “{query}”…")
-        self._controller.search_server(self._current_folder, query)
+        controller.search_server(self._current_folder, query)
 
     def _on_filter_changed(self) -> None:
         criteria = self._filter.currentData()
         self._proxy.set_quick_filter(criteria)
         self._settings.default_filter = criteria
-        self._controller.set_target(self._current_folder, criteria)
-        self._update_unread_label()
+        controller = self.controller()
+        if controller is not None:
+            controller.set_target(self._current_folder, criteria)
+        self._update_unread()
 
     def _on_sort_changed(self) -> None:
         descending = self._sort_direction.isChecked()
@@ -1614,27 +1976,39 @@ class MainWindow(QMainWindow):
     def open_settings(self) -> None:
         from settings_dialog import SettingsDialog
 
-        previous_interval = self._settings.sync.interval_seconds
-        previous_account = (self._settings.account.host, self._settings.account.username,
-                            self._settings.account.password)
+        before = {p.name: (p.account.host, p.account.username, p.account.password)
+                  for p in self._settings.profiles}
         dialog = SettingsDialog(self._settings, self)
         if dialog.exec() != QDialog.Accepted:
             return
 
-        self._controller.apply_interval(self._settings.sync.interval_seconds)
-        current_account = (self._settings.account.host, self._settings.account.username,
-                           self._settings.account.password)
-        if current_account != previous_account:
-            self._store.clear()
-            self._model.clear()
-            self._controller.update_account(self._settings.account)
-            self._controller.list_folders()
-            self._controller.sync_now(self._current_folder, self._filter.currentData())
-        elif previous_interval != self._settings.sync.interval_seconds:
-            self.statusBar().showMessage(
-                "Refresh interval updated", 5000
-            )
+        after = {p.name: (p.account.host, p.account.username, p.account.password)
+                 for p in self._settings.profiles}
+
+        for name in list(self._controllers):
+            if name not in after:
+                self._drop_controller(name)
+        self._create_controllers()
+
+        for name, credentials in after.items():
+            controller = self.controller(name)
+            if controller is None:
+                continue
+            controller.apply_interval(self._settings.sync.interval_seconds)
+            if before.get(name) != credentials:
+                self.store(name).clear()
+                if name == self._current_account:
+                    self._model.clear()
+                controller.update_account(self._settings.find_profile(name).account)
+                controller.list_folders()
+                controller.sync_now(self._current_folder if name == self._current_account
+                                    else "INBOX", self._filter.currentData())
+
+        self._folder_tree.set_accounts([p.name for p in self._settings.profiles])
         self._images_action.setChecked(self._settings.allow_remote_images)
+        self._outbox_timer.setInterval(
+            max(30, self._settings.sync.outbox_retry_seconds) * 1000)
+        self._update_unread()
 
     def open_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1645,7 +2019,8 @@ class MainWindow(QMainWindow):
             return
         self._current_folder = "(files)"
         self._model.clear()
-        self._start_file_worker(FileLoadWorker(paths), f"Loading {len(paths)} file(s)…")
+        self._start_file_worker(FileLoadWorker(paths, self._current_account),
+                                f"Loading {len(paths)} file(s)…")
 
     def _start_file_worker(self, worker: QObject, message: str) -> None:
         thread = QThread(self)
@@ -1668,8 +2043,36 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Loaded {count} message(s)")
             self._select_first_row()
 
-    # ---------------------------------------------------------------- close
+    # ------------------------------------------------------------ tray/close
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_application(self) -> None:
+        self._quitting = True
+        self.close()
+        application = QApplication.instance()
+        if application is not None:
+            application.quit()
+
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        # With notifications on, closing the window keeps the client running in
+        # the tray - otherwise "notify me about new mail" could never work.
+        if (not self._quitting and self._notifications.available
+                and self._settings.notifications.enabled
+                and self._settings.notifications.minimize_to_tray
+                and not self._start_offline):
+            event.ignore()
+            self.hide()
+            if not self._tray_hint_shown:
+                self._tray_hint_shown = True
+                self._notifications.notify(
+                    "Mail Viewer is still running",
+                    "New mail will be announced here. Use the tray icon to quit."
+                )
+            return
+
         window = self._settings.window
         window.maximized = self.isMaximized()
         if not self.isMaximized():
@@ -1680,10 +2083,14 @@ class MainWindow(QMainWindow):
 
         for compose in list(self._compose_windows):
             compose.close()
-        self._controller.shutdown()
-        if self._file_thread is not None:
-            self._file_thread.quit()
-            self._file_thread.wait(2000)
+        self._outbox_timer.stop()
+        for controller in self._controllers.values():
+            controller.shutdown()
+        for thread in (self._file_thread, self._outbox_thread):
+            if thread is not None:
+                thread.quit()
+                thread.wait(2000)
+        self._notifications.shutdown()
         self._body.shutdown()
         super().closeEvent(event)
 
@@ -1715,11 +2122,15 @@ def run(settings: Optional[AppSettings] = None, eml_paths: Optional[list[str]] =
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("EmailChecking")
+    app.setWindowIcon(make_mail_icon(0))
     apply_theme(app, settings.theme)
+    # The window may be hidden to the tray; that must not quit the application.
+    app.setQuitOnLastWindowClosed(not settings.notifications.enabled)
 
     window = MainWindow(settings, start_offline=bool(eml_paths))
     window.show()
     if eml_paths:
         window._current_folder = "(files)"
-        window._start_file_worker(FileLoadWorker(list(eml_paths)), "Loading files…")
+        window._start_file_worker(
+            FileLoadWorker(list(eml_paths), window._current_account), "Loading files…")
     return app.exec()

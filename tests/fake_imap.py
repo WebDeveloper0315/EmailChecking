@@ -22,7 +22,8 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Iterator, Optional
 
-__all__ = ["FakeMessage", "FakeIMAP", "fake_imap_server", "sample_message"]
+__all__ = ["FakeMessage", "FakeIMAP", "fake_imap_server", "fake_imap_servers",
+           "sample_message"]
 
 
 def sample_message(subject: str = "Test", body: str = "hello",
@@ -334,41 +335,61 @@ def _matches(message: FakeMessage, query: str) -> bool:
 
 
 class _FakeTransport:
-    """Stands in for ``imbox.imap.ImapTransport``."""
+    """Stands in for ``imbox.imap.ImapTransport``.
 
-    server_factory = None            # set by fake_imap_server()
+    The server is chosen at login time from the user name, so several accounts
+    can be served at once (multi-account tests).
+    """
+
+    resolver = None                  # set by the context managers below
 
     def __init__(self, hostname, port=None, ssl=True, ssl_context=None, starttls=False):
         self.hostname = hostname
         self.port = port or (993 if ssl else 143)
-        self.server = type(self).server_factory()
+        self.server: Optional[FakeIMAP] = None
 
     def list_folders(self):
-        return self.server.list()
+        return self.server.list() if self.server else ("NO", [])
 
     def connect(self, username, password):
+        self.server = type(self).resolver(username)
+        if self.server is None:
+            raise imaplib.IMAP4.error(b"[AUTHENTICATIONFAILED] Unknown mailbox")
         self.server.login(username, password)
         self.server.select()
         return self.server
 
 
 @contextmanager
-def fake_imap_server(**kwargs) -> Iterator[FakeIMAP]:
-    """Patch imbox so every connection lands on an in-memory server."""
+def _patched(resolver) -> Iterator[None]:
     import imbox.imap
     import imbox.imbox
 
-    server = FakeIMAP(**kwargs)
-
     class Transport(_FakeTransport):
-        server_factory = staticmethod(lambda: server)
+        pass
 
+    Transport.resolver = staticmethod(resolver)
     original_imap = imbox.imap.ImapTransport
     original_imbox = imbox.imbox.ImapTransport
     imbox.imap.ImapTransport = Transport
     imbox.imbox.ImapTransport = Transport
     try:
-        yield server
+        yield
     finally:
         imbox.imap.ImapTransport = original_imap
         imbox.imbox.ImapTransport = original_imbox
+
+
+@contextmanager
+def fake_imap_server(**kwargs) -> Iterator[FakeIMAP]:
+    """Patch imbox so every connection lands on one in-memory server."""
+    server = FakeIMAP(**kwargs)
+    with _patched(lambda username: server):
+        yield server
+
+
+@contextmanager
+def fake_imap_servers(servers: dict[str, FakeIMAP]) -> Iterator[dict[str, FakeIMAP]]:
+    """Serve several accounts at once, keyed by user name."""
+    with _patched(lambda username: servers.get(username)):
+        yield servers

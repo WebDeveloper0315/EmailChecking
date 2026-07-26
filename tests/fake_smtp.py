@@ -93,6 +93,10 @@ def fake_smtp_server(fail_on: Optional[str] = None, accept_password: str = "secr
 
     import mail_sender
 
+    # The failure diagnosis probes real sockets; stub it so tests stay offline.
+    original_diagnose = mail_sender.diagnose_unreachable
+    mail_sender.diagnose_unreachable = lambda host: "(diagnosis skipped in tests)"
+
     mail_sender.smtplib.SMTP = FakeSMTP          # type: ignore[assignment]
     mail_sender.smtplib.SMTP_SSL = FakeSMTP      # type: ignore[assignment]
     try:
@@ -100,5 +104,6 @@ def fake_smtp_server(fail_on: Optional[str] = None, accept_password: str = "secr
     finally:
         mail_sender.smtplib.SMTP = original_smtp      # type: ignore[assignment]
         mail_sender.smtplib.SMTP_SSL = original_ssl   # type: ignore[assignment]
+        mail_sender.diagnose_unreachable = original_diagnose
         FakeSMTP.fail_on = None
         FakeSMTP.refuse_recipients = ()

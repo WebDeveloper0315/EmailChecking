@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import Sequence
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -31,11 +32,45 @@ if not qt_bootstrap.prepare():  # pragma: no cover - no GUI stack installed
 
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
-from config import AccountSettings, AppSettings, SmtpSettings  # noqa: E402
-from fake_imap import FakeMessage, fake_imap_server, sample_message  # noqa: E402
+from config import (  # noqa: E402
+    AccountProfile,
+    AccountSettings,
+    AppSettings,
+    SmtpSettings,
+)
+from fake_imap import (  # noqa: E402
+    FakeIMAP,
+    FakeMessage,
+    fake_imap_server,
+    fake_imap_servers,
+    sample_message,
+)
 from fake_smtp import fake_smtp_server  # noqa: E402
 
 import viewer  # noqa: E402
+
+
+def make_profile(name: str = "Personal", username: str = "user@example.com",
+                 password: str = "secret") -> AccountProfile:
+    return AccountProfile(
+        name=name,
+        account=AccountSettings(host="imap.example.com", port=993,
+                                username=username, password=password),
+        smtp=SmtpSettings(host="smtp.example.com", port=587, security="starttls",
+                          username=username, password=password),
+    )
+
+
+def make_settings(temp: Path, profiles: Sequence[AccountProfile]) -> AppSettings:
+    settings = AppSettings(profiles=list(profiles),
+                           active_profile=profiles[0].name,
+                           path=temp / "config.ini")
+    settings.download_dir = str(temp / "downloads")
+    settings.sync.cache_dir = str(temp / "cache")
+    settings.sync.interval_seconds = 0        # manual: the tests drive the sync
+    settings.sync.sync_on_start = True
+    settings.notifications.minimize_to_tray = False   # tests close the window
+    return settings
 
 APP = QApplication.instance() or QApplication([])
 
@@ -80,17 +115,7 @@ class GuiTestCase(unittest.TestCase):
 
     def setUp(self) -> None:
         self.temp = Path(tempfile.mkdtemp(prefix="mailgui-test-"))
-        self.settings = AppSettings(
-            account=AccountSettings(host="imap.example.com", port=993,
-                                    username="user@example.com", password="secret"),
-            smtp=SmtpSettings(host="smtp.example.com", port=587, security="starttls",
-                              username="user@example.com", password="secret"),
-            path=self.temp / "config.ini",
-        )
-        self.settings.download_dir = str(self.temp / "downloads")
-        self.settings.sync.cache_dir = str(self.temp / "cache")
-        self.settings.sync.interval_seconds = 0        # manual: tests drive the sync
-        self.settings.sync.sync_on_start = True
+        self.settings = make_settings(self.temp, [make_profile()])
 
         self._server_context = fake_imap_server(mailboxes=mailboxes(self.message_count),
                                                 folder_flags=FOLDER_FLAGS)
@@ -124,9 +149,9 @@ class GuiTestCase(unittest.TestCase):
 class StartupTests(GuiTestCase):
     def test_messages_and_folders_are_loaded(self) -> None:
         self.assertEqual(self.window._model.rowCount(), self.message_count)
-        self.assertIn("INBOX", self.window._folders)
-        self.assertEqual(self.window._folders["Sent"].kind, "sent")
-        self.assertEqual(self.window._folders["Trash"].kind, "trash")
+        self.assertIn("INBOX", self.window._folders["Personal"])
+        self.assertEqual(self.window._folders["Personal"]["Sent"].kind, "sent")
+        self.assertEqual(self.window._folders["Personal"]["Trash"].kind, "trash")
 
     def test_newest_message_is_selected_and_rendered(self) -> None:
         self.select_row(0)
@@ -172,9 +197,9 @@ class SyncTests(GuiTestCase):
     def test_flag_change_on_the_server_is_picked_up(self) -> None:
         self.server.mailboxes["INBOX"][0].flags.add("\\Seen")
         self.window.sync_now()
-        pump(lambda: self.window._store.message("INBOX", 1) is not None
-             and self.window._store.message("INBOX", 1).is_read)
-        self.assertTrue(self.window._store.message("INBOX", 1).is_read)
+        pump(lambda: self.window.store().message("INBOX", 1) is not None
+             and self.window.store().message("INBOX", 1).is_read)
+        self.assertTrue(self.window.store().message("INBOX", 1).is_read)
 
     def test_message_deleted_elsewhere_disappears(self) -> None:
         self.server.mailboxes["INBOX"] = [
@@ -232,7 +257,7 @@ class MessageActionTests(GuiTestCase):
         self.window.set_read(True)
         pump(lambda: "\\Seen" in self.server_message(uid).flags)
         self.assertIn("\\Seen", self.server_message(uid).flags)
-        self.assertTrue(self.window._store.message("INBOX", uid).is_read)
+        self.assertTrue(self.window.store().message("INBOX", uid).is_read)
 
         self.window.set_read(False)
         pump(lambda: "\\Seen" not in self.server_message(uid).flags)
@@ -328,7 +353,7 @@ class SearchSortFilterTests(GuiTestCase):
         self.select_row(0)
         uid = self.window._current.uid_number
         self.window.set_read(True)
-        pump(lambda: self.window._store.message("INBOX", uid).is_read)
+        pump(lambda: self.window.store().message("INBOX", uid).is_read)
 
         index = [f[0] for f in viewer.FILTERS].index("unread")
         self.window._filter.setCurrentIndex(index)
@@ -427,27 +452,256 @@ class FolderTests(GuiTestCase):
         self.server.mailboxes["Sent"].append(
             FakeMessage(uid=500, raw=sample_message(subject="A sent message"))
         )
-        self.window.open_folder("Sent")
+        self.window.open_folder("Personal", "Sent")
         pump(lambda: self.window._model.rowCount() == 1, timeout=8)
         self.assertEqual(self.window._model.rowCount(), 1)
         self.assertEqual(self.window._model.emails[0].subject, "A sent message")
 
-        self.window.open_folder("INBOX")
+        self.window.open_folder("Personal", "INBOX")
         pump(lambda: self.window._model.rowCount() == self.message_count, timeout=8)
         self.assertEqual(self.window._model.rowCount(), self.message_count)
+
+
+class NotificationTests(GuiTestCase):
+    """New-mail notifications: quiet on the first load, loud afterwards."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.toasts: list[tuple[str, str, list]] = []
+        # Spy on the notification centre rather than the OS toast.
+        self.window._notifications.notify_new_messages = (
+            lambda account, folder, messages: self.toasts.append(
+                (account, folder, list(messages))) or True
+        )
+
+    def test_first_sync_does_not_notify(self) -> None:
+        self.assertEqual(self.toasts, [],
+                         "loading an existing mailbox must not raise 200 toasts")
+
+    def test_new_message_notifies(self) -> None:
+        self.server.mailboxes["INBOX"].append(
+            FakeMessage(uid=77, raw=sample_message(subject="Ping", sender="boss@corp.example"))
+        )
+        self.window.sync_now()
+        pump(lambda: bool(self.toasts), timeout=8)
+        self.assertEqual(len(self.toasts), 1)
+        account, folder, messages = self.toasts[0]
+        self.assertEqual(account, "Personal")
+        self.assertEqual(folder, "INBOX")
+        self.assertEqual([m.subject for m in messages], ["Ping"])
+
+    def test_messages_already_read_do_not_notify(self) -> None:
+        self.server.mailboxes["INBOX"].append(
+            FakeMessage(uid=78, raw=sample_message(subject="Seen already"),
+                        flags={"\\Seen"})
+        )
+        self.window.sync_now()
+        pump(lambda: self.window._model.row_for_uid("78") >= 0, timeout=8)
+        pump(timeout=0.5)
+        self.assertEqual(self.toasts, [])
+
+    def test_unread_badge_tracks_the_mailbox(self) -> None:
+        seen: list[int] = []
+        self.window._notifications.set_unread = lambda total, per=None: seen.append(total)
+        self.window._update_unread()
+        self.assertTrue(seen)
+        self.assertEqual(seen[-1], self.message_count)
+
+    def test_tray_icon_renders_with_and_without_a_badge(self) -> None:
+        from notifications import make_mail_icon
+
+        self.assertFalse(make_mail_icon(0).isNull())
+        self.assertFalse(make_mail_icon(7).isNull())
+        self.assertFalse(make_mail_icon(150).isNull())
+
+
+class MultiAccountTests(unittest.TestCase):
+    """Two accounts, synchronised at the same time."""
+
+    def setUp(self) -> None:
+        self.temp = Path(tempfile.mkdtemp(prefix="mailgui-multi-"))
+        self.personal = FakeIMAP(
+            mailboxes={"INBOX": [FakeMessage(uid=1, raw=sample_message(subject="Personal 1")),
+                                 FakeMessage(uid=2, raw=sample_message(subject="Personal 2"))],
+                       "Sent": [], "Trash": []},
+            username="me@personal.example", password="secret1",
+            folder_flags=FOLDER_FLAGS,
+        )
+        self.work = FakeIMAP(
+            mailboxes={"INBOX": [FakeMessage(uid=1, raw=sample_message(subject="Work 1"))],
+                       "Sent": [], "Trash": []},
+            username="me@work.example", password="secret2",
+            folder_flags=FOLDER_FLAGS,
+        )
+        self.settings = make_settings(self.temp, [
+            make_profile("Personal", "me@personal.example", "secret1"),
+            make_profile("Work", "me@work.example", "secret2"),
+        ])
+        self._context = fake_imap_servers({
+            "me@personal.example": self.personal,
+            "me@work.example": self.work,
+        })
+        self._context.__enter__()
+
+        self.window = viewer.MainWindow(self.settings)
+        self.window.show()
+        pump(lambda: self.window._model.rowCount() >= 2, timeout=10)
+
+    def tearDown(self) -> None:
+        self.window.close()
+        pump(timeout=1.0)
+        self.window.deleteLater()
+        pump(timeout=0.5)
+        self._context.__exit__(None, None, None)
+        shutil.rmtree(self.temp, ignore_errors=True)
+
+    def test_both_accounts_have_their_own_connection_and_store(self) -> None:
+        pump(lambda: len(self.window.store("Work").messages("INBOX")) == 1, timeout=10)
+        self.assertEqual(len(self.window.store("Personal").messages("INBOX")), 2)
+        self.assertEqual(len(self.window.store("Work").messages("INBOX")), 1)
+        self.assertTrue(self.personal.logged_in)
+        self.assertTrue(self.work.logged_in)
+
+    def test_switching_account_swaps_the_message_list(self) -> None:
+        self.assertEqual(self.window._current_account, "Personal")
+        subjects = {m.subject for m in self.window._model.emails}
+        self.assertTrue(subjects <= {"Personal 1", "Personal 2"})
+
+        pump(lambda: len(self.window.store("Work").messages("INBOX")) == 1, timeout=10)
+        self.window.open_folder("Work", "INBOX")
+        pump(lambda: self.window._current_account == "Work"
+             and self.window._model.rowCount() == 1, timeout=10)
+        self.assertEqual([m.subject for m in self.window._model.emails], ["Work 1"])
+        self.assertEqual(self.settings.active_profile, "Work")
+
+        self.window.open_folder("Personal", "INBOX")
+        pump(lambda: self.window._model.rowCount() == 2, timeout=10)
+        self.assertEqual(self.window._current_account, "Personal")
+
+    def test_actions_apply_to_the_account_that_owns_the_message(self) -> None:
+        pump(lambda: len(self.window.store("Work").messages("INBOX")) == 1, timeout=10)
+        self.window.open_folder("Work", "INBOX")
+        pump(lambda: self.window._model.rowCount() == 1, timeout=10)
+        self.window._list_view.setCurrentIndex(self.window._proxy.index(0, 0))
+        pump(lambda: self.window._current is not None, timeout=5)
+
+        self.window.toggle_star()
+        pump(lambda: "\\Flagged" in self.work.mailboxes["INBOX"][0].flags, timeout=8)
+        self.assertIn("\\Flagged", self.work.mailboxes["INBOX"][0].flags)
+        # The other account must be untouched.
+        self.assertTrue(all("\\Flagged" not in m.flags
+                            for m in self.personal.mailboxes["INBOX"]))
+
+    def test_folder_tree_lists_every_account(self) -> None:
+        pump(lambda: ("Work", "INBOX") in self.window._folder_tree._items, timeout=10)
+        self.assertIn(("Personal", "INBOX"), self.window._folder_tree._items)
+        self.assertIn(("Work", "INBOX"), self.window._folder_tree._items)
+
+    def test_new_account_appears_after_being_added(self) -> None:
+        third = make_profile("Third", "me@third.example", "secret3")
+        self.settings.add_profile(third)
+        self.window._create_controllers()
+        self.assertIn("Third", self.window._controllers)
+        self.window._drop_controller("Third")
+        self.assertNotIn("Third", self.window._controllers)
+
+
+class OutboxTests(GuiTestCase):
+    """A message that cannot go out now is kept and retried."""
+
+    def _answer_queue_prompt(self, keep: bool = True) -> None:
+        from PySide6.QtWidgets import QMessageBox
+
+        original_exec = QMessageBox.exec
+        original_clicked = QMessageBox.clickedButton
+
+        def fake_exec(box_self):
+            wanted = "Keep in Outbox" if keep else "Discard"
+            for button in box_self.buttons():
+                if button.text().replace("&", "") == wanted:
+                    box_self._clicked = button
+                    box_self.done(0)
+                    return 0
+            return 0
+
+        QMessageBox.exec = fake_exec
+        QMessageBox.clickedButton = lambda box_self: getattr(box_self, "_clicked", None)
+        self.addCleanup(lambda: setattr(QMessageBox, "exec", original_exec))
+        self.addCleanup(lambda: setattr(QMessageBox, "clickedButton", original_clicked))
+
+    def _compose(self, subject: str = "Queued message"):
+        from mail_sender import Draft
+
+        self.window._open_compose(Draft(
+            to=["someone@example.com"], subject=subject,
+            body_text="hello", from_address="user@example.com",
+        ))
+        pump(lambda: bool(self.window._compose_windows), timeout=3)
+        return self.window._compose_windows[-1]
+
+    def test_unreachable_server_queues_the_message(self) -> None:
+        self._answer_queue_prompt(keep=True)
+        compose = self._compose()
+        with fake_smtp_server(fail_on="ehlo"):
+            compose.send()
+            pump(lambda: self.window._outbox.count() == 1, timeout=15)
+        self.assertEqual(self.window._outbox.count(), 1)
+        queued = self.window._outbox.all()[0]
+        self.assertEqual(queued.subject, "Queued message")
+        self.assertEqual(queued.recipients, ["someone@example.com"])
+        self.assertIn("queued", self.window._outbox_label.text().lower())
+
+    def test_declining_the_prompt_keeps_the_window_open(self) -> None:
+        self._answer_queue_prompt(keep=False)
+        compose = self._compose("Not queued")
+        with fake_smtp_server(fail_on="ehlo"):
+            compose.send()
+            pump(timeout=6)
+        self.assertEqual(self.window._outbox.count(), 0)
+        compose.close()
+        pump(timeout=0.5)
+
+    def test_retry_sends_the_queued_message_and_files_it_in_sent(self) -> None:
+        self._answer_queue_prompt(keep=True)
+        compose = self._compose("Retry me")
+        with fake_smtp_server(fail_on="ehlo"):
+            compose.send()
+            pump(lambda: self.window._outbox.count() == 1, timeout=15)
+
+        # The queue schedules a retry a minute out; the user can force it.
+        item = self.window._outbox.all()[0]
+        item.next_attempt = "2000-01-01T00:00:00+00:00"
+        self.window._outbox._paths(item.identifier)[1].write_text(
+            __import__("json").dumps(item.metadata()), encoding="utf-8")
+
+        with fake_smtp_server() as fake:
+            self.window.retry_outbox()
+            pump(lambda: bool(fake.instances and fake.instances[-1].sent), timeout=15)
+            self.assertTrue(fake.instances[-1].sent)
+        pump(lambda: self.window._outbox.count() == 0, timeout=8)
+        self.assertEqual(self.window._outbox.count(), 0)
+        pump(lambda: len(self.server.mailboxes["Sent"]) == 1, timeout=8)
+        self.assertEqual(len(self.server.mailboxes["Sent"]), 1)
+
+    def test_permanent_failure_is_not_retried_forever(self) -> None:
+        from outbox import Outbox
+
+        outbox = Outbox(self.temp / "outbox-unit")
+        item = outbox.add(b"raw", "me@example.com", ["you@example.com"], "Personal",
+                          subject="Doomed")
+        self.assertEqual(outbox.count(), 1)
+        for _ in range(3):
+            outbox.record_failure(item, "still unreachable")
+        self.assertEqual(item.attempts, 3)
+        self.assertFalse(item.due)          # backoff pushed it into the future
+        outbox.remove(item)
+        self.assertEqual(outbox.count(), 0)
 
 
 class ErrorHandlingTests(unittest.TestCase):
     def test_authentication_failure_is_reported_not_crashed(self) -> None:
         temp = Path(tempfile.mkdtemp(prefix="mailgui-auth-"))
-        settings = AppSettings(
-            account=AccountSettings(host="imap.example.com", username="user@example.com",
-                                    password="wrong-password"),
-            path=temp / "config.ini",
-        )
-        settings.sync.interval_seconds = 0
-        settings.sync.cache_dir = str(temp / "cache")
-        settings.sync.sync_on_start = True
+        settings = make_settings(temp, [make_profile(password="wrong-password")])
 
         with fake_imap_server(mailboxes=mailboxes(1), password="secret"):
             window = viewer.MainWindow(settings)

@@ -79,7 +79,8 @@ IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp"}
 class SendWorker(QObject):
     """Runs one SMTP conversation off the UI thread."""
 
-    finished = Signal(object, str)      # SendResult | None, error text
+    #: SendResult | None, error text, retryable
+    finished = Signal(object, str, bool)
 
     def __init__(self, settings, draft: Draft) -> None:
         super().__init__()
@@ -89,12 +90,12 @@ class SendWorker(QObject):
     def run(self) -> None:
         try:
             result = SmtpSender(self._settings).send(self._draft)
-            self.finished.emit(result, "")
+            self.finished.emit(result, "", False)
         except SendError as exc:
-            self.finished.emit(None, str(exc))
+            self.finished.emit(None, str(exc), exc.retryable)
         except Exception as exc:  # never lose the thread to a bug
             logger.exception("Unexpected error while sending")
-            self.finished.emit(None, f"Unexpected error: {exc}")
+            self.finished.emit(None, f"Unexpected error: {exc}", False)
 
 
 class _ComposeEditor(QTextEdit):
@@ -121,15 +122,18 @@ class ComposeWindow(QMainWindow):
 
     message_sent = Signal(object)       # SendResult
     draft_saved = Signal(object)        # bytes
+    message_queued = Signal(dict)       # raw/sender/recipients/subject/account/error
 
     def __init__(
         self,
         settings: AppSettings,
         draft: Optional[Draft] = None,
         parent: Optional[QWidget] = None,
+        account: str = "",
     ) -> None:
         super().__init__(parent)
         self._settings = settings
+        self._account = account or settings.profile.name
         self._attachments: list[DraftAttachment] = []
         self._thread: Optional[QThread] = None
         self._worker: Optional[SendWorker] = None
@@ -156,8 +160,16 @@ class ComposeWindow(QMainWindow):
         form.setHorizontalSpacing(10)
         form.setVerticalSpacing(4)
 
-        self._from = QLineEdit()
-        self._from.setReadOnly(True)
+        # "From" is a picker: with several accounts configured it decides which
+        # server the message goes out through.
+        self._from = QComboBox()
+        self._from.setEditable(False)
+        for profile in self._settings.profiles:
+            self._from.addItem(profile.identity(), profile.name)
+        if self._from.count() == 0:
+            self._from.addItem(self._settings.profile.identity(), self._settings.profile.name)
+        index = self._from.findData(self._account)
+        self._from.setCurrentIndex(max(0, index))
         self._to = QLineEdit()
         self._to.setPlaceholderText("recipient@example.com, another@example.com")
         self._cc = QLineEdit()
@@ -422,10 +434,34 @@ class ComposeWindow(QMainWindow):
             self._attachment_label.setText("Attachments (none)")
 
     # --------------------------------------------------------------- draft
+    def selected_account(self) -> str:
+        """Name of the profile the message will be sent from."""
+        return str(self._from.currentData() or self._account)
+
+    def selected_profile(self):
+        return (self._settings.find_profile(self.selected_account())
+                or self._settings.profile)
+
+    def _from_text(self) -> str:
+        return self._from.currentText().strip()
+
+    def _select_from(self, text: str) -> None:
+        """Pick the account matching an address, falling back to the first."""
+        from email.utils import parseaddr
+
+        _, address = parseaddr(text)
+        profile = self._settings.profile_for_address(address)
+        if profile is not None:
+            index = self._from.findData(profile.name)
+            if index >= 0:
+                self._from.setCurrentIndex(index)
+                return
+        if text and self._from.findText(text) < 0 and self._from.count() == 0:
+            self._from.addItem(text, self._account)
+            self._from.setCurrentIndex(self._from.count() - 1)
+
     def _default_from(self) -> str:
-        smtp = self._settings.smtp_settings()
-        address = smtp.username or self._settings.account.username
-        return f"{smtp.from_name} <{address}>" if smtp.from_name else address
+        return self.selected_profile().identity()
 
     def load_draft(self, draft: Draft) -> None:
         """Fill the window from a prepared draft (reply / forward / stored)."""
@@ -434,7 +470,7 @@ class ComposeWindow(QMainWindow):
         self._bcc.setText(", ".join(draft.bcc))
         self._subject.setText(draft.subject)
         self._priority.setChecked(draft.high_priority)
-        self._from.setText(
+        self._select_from(
             f"{draft.from_name} <{draft.from_address}>" if draft.from_name
             else draft.from_address or self._default_from()
         )
@@ -477,7 +513,7 @@ class ComposeWindow(QMainWindow):
                 allow_remote_images=True,
             ).html
 
-        from_text = self._from.text().strip()
+        from_text = self._from_text()
         from email.utils import parseaddr
 
         from_name, from_address = parseaddr(from_text)
@@ -508,14 +544,17 @@ class ComposeWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot send", "\n".join(problems))
             return
 
-        smtp = self._settings.smtp_settings()
+        profile = self.selected_profile()
+        smtp = self._settings.smtp_settings(profile)
         if not smtp.is_complete:
             QMessageBox.warning(
                 self, "Cannot send",
-                "Sending is not configured.\n\nOpen Settings → Sending and enter the "
-                "SMTP server, user name and password.",
+                f"Sending is not configured for “{profile.display}”.\n\n"
+                "Open Settings → Sending and enter the SMTP server, user name "
+                "and password.",
             )
             return
+        self._pending_draft = draft
 
         self._send_button.setEnabled(False)
         self._progress = QProgressDialog("Sending message…", "", 0, 0, self)
@@ -533,7 +572,8 @@ class ComposeWindow(QMainWindow):
         self._thread.finished.connect(self._worker.deleteLater)
         self._thread.start()
 
-    def _on_sent(self, result: Optional[SendResult], error: str) -> None:
+    def _on_sent(self, result: Optional[SendResult], error: str,
+                 retryable: bool = False) -> None:
         if self._progress is not None:
             self._progress.close()
             self._progress = None
@@ -542,6 +582,8 @@ class ComposeWindow(QMainWindow):
         self._send_button.setEnabled(True)
 
         if error:
+            if retryable and self._offer_outbox(error):
+                return
             QMessageBox.critical(self, "Message not sent", error)
             return
 
@@ -553,6 +595,48 @@ class ComposeWindow(QMainWindow):
             )
         self.message_sent.emit(result)
         self.close()
+
+    def _offer_outbox(self, error: str) -> bool:
+        """The server was unreachable: keep the message and retry later."""
+        draft = getattr(self, "_pending_draft", None)
+        if draft is None:
+            return False
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Message not sent")
+        box.setIcon(QMessageBox.Warning)
+        box.setText("The mail server could not be reached.")
+        box.setInformativeText(
+            "The message can wait in the Outbox and be sent automatically as soon "
+            "as the server answers."
+        )
+        box.setDetailedText(error)
+        queue_button = box.addButton("Keep in Outbox", QMessageBox.AcceptRole)
+        box.addButton("Discard", QMessageBox.RejectRole)
+        box.exec()
+        if box.clickedButton() is not queue_button:
+            return False
+
+        try:
+            message = build_message(draft, include_bcc=False)
+            payload = {
+                "raw": message.as_bytes(),
+                "sender": draft.from_address,
+                "recipients": draft.recipients,
+                "subject": draft.subject,
+                "message_id": str(message.get("Message-ID", "")),
+                "account": self.selected_account(),
+                "error": error,
+            }
+        except Exception as exc:
+            QMessageBox.critical(self, "Message not sent",
+                                 f"{error}\n\nThe message could not be queued either: {exc}")
+            return False
+
+        self.message_queued.emit(payload)
+        self._editor.document().setModified(False)
+        self.close()
+        return True
 
     def save_draft(self) -> None:
         draft = self.current_draft()

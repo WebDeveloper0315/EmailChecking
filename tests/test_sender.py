@@ -289,11 +289,42 @@ class SendingTests(unittest.TestCase):
                 SmtpSender(SMTP).send(simple_draft())
         self.assertIn("dropped", str(caught.exception))
 
-    def test_tls_error_is_explained(self) -> None:
+    def test_tls_failure_falls_back_to_the_next_port(self) -> None:
+        """587/STARTTLS broken -> 465/SSL is tried automatically."""
+        with fake_smtp_server(fail_on="starttls") as fake:
+            result = SmtpSender(SMTP).send(simple_draft())
+        self.assertTrue(result.recipients)
+        # Two sessions: the failed STARTTLS one and the successful SSL one.
+        self.assertGreaterEqual(len(fake.instances), 2)
+        self.assertEqual(fake.instances[-1].port, 465)
+        self.assertFalse(fake.instances[-1].started_tls)
+
+    def test_tls_error_is_explained_when_fallback_is_off(self) -> None:
+        settings = SmtpSettings(**{**SMTP.__dict__, "auto_port_fallback": False})
         with fake_smtp_server(fail_on="starttls"):
             with self.assertRaises(SendError) as caught:
+                SmtpSender(settings).send(simple_draft())
+        self.assertIn("TLS handshake failed", str(caught.exception))
+        self.assertTrue(caught.exception.retryable)
+
+    def test_unreachable_server_is_retryable(self) -> None:
+        with fake_smtp_server(fail_on="ehlo"):
+            with self.assertRaises(SendError) as caught:
                 SmtpSender(SMTP).send(simple_draft())
-        self.assertIn("Secure connection", str(caught.exception))
+        self.assertTrue(caught.exception.retryable)
+
+    def test_authentication_failure_is_not_retryable(self) -> None:
+        with fake_smtp_server(fail_on="login"):
+            with self.assertRaises(SendError) as caught:
+                SmtpSender(SMTP).send(simple_draft())
+        self.assertFalse(caught.exception.retryable)
+
+    def test_send_raw_reuses_a_built_message(self) -> None:
+        raw = build_message(simple_draft()).as_bytes()
+        with fake_smtp_server() as fake:
+            result = SmtpSender(SMTP).send_raw(raw, "me@example.com", ["alice@example.com"])
+        self.assertEqual(fake.instances[0].sent[0][2], raw)
+        self.assertEqual(result.recipients, ["alice@example.com"])
 
     def test_missing_host_is_reported(self) -> None:
         with self.assertRaises(SendError):

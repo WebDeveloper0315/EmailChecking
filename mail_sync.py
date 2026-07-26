@@ -223,24 +223,34 @@ except Exception:  # pragma: no cover - only on installs without PySide6
 if QT_AVAILABLE:
 
     class SyncWorker(QObject):
-        """Owns the IMAP connection and executes every network request."""
+        """Owns the IMAP connection and executes every network request.
 
-        folders_listed = Signal(object)          # list[FolderInfo]
-        sync_started = Signal(str)               # folder
-        sync_progress = Signal(int, int)         # done, total
-        message_arrived = Signal(object)         # Email
-        flags_changed = Signal(str, int, object)  # folder, uid, frozenset[str]
-        messages_removed = Signal(str, object)   # folder, list[int]
-        sync_finished = Signal(object)           # SyncResult
-        operation_finished = Signal(str, bool, str)   # operation, ok, message
-        connection_changed = Signal(bool, str)   # connected, message
-        cache_loaded = Signal(str, int)          # folder, count
+        Every signal carries the account name as its first argument.  That is
+        not decoration: it lets the window connect **bound methods** instead of
+        lambdas.  A lambda has no QObject receiver, so Qt cannot tell which
+        thread it belongs to and falls back to a direct connection - the UI code
+        would then run inside this worker thread, which is exactly what must
+        never happen.
+        """
 
-        def __init__(self, account, store: MailStore, max_messages: int = 200) -> None:
+        folders_listed = Signal(str, object)          # account, list[FolderInfo]
+        sync_started = Signal(str, str)               # account, folder
+        sync_progress = Signal(str, int, int)         # account, done, total
+        message_arrived = Signal(str, object)         # account, Email
+        flags_changed = Signal(str, str, int, object)  # account, folder, uid, flags
+        messages_removed = Signal(str, str, object)   # account, folder, list[int]
+        sync_finished = Signal(str, object)           # account, SyncResult
+        operation_finished = Signal(str, str, bool, str)  # account, operation, ok, message
+        connection_changed = Signal(str, bool, str)   # account, connected, message
+        cache_loaded = Signal(str, str, int)          # account, folder, count
+
+        def __init__(self, account, store: MailStore, max_messages: int = 200,
+                     name: str = "") -> None:
             super().__init__()
             self._account = account
             self._store = store
             self._max_messages = max_messages
+            self._name = name or getattr(account, "username", "") or "account"
             self._client: Optional[ImapClient] = None
             self._stop_event = threading.Event()
             self._busy = False
@@ -263,14 +273,14 @@ if QT_AVAILABLE:
             if self._client is None:
                 self._client = ImapClient(self._account)
                 self._client.connect()
-                self.connection_changed.emit(True, f"Connected to {self._account.host}")
+                self.connection_changed.emit(self._name, True, f"Connected to {self._account.host}")
             elif not self._client.noop():
                 logger.info("Connection lost, reconnecting",
                             extra={"event": "reconnect", "host": self._account.host})
                 self._disconnect()
                 self._client = ImapClient(self._account)
                 self._client.connect()
-                self.connection_changed.emit(True, "Reconnected")
+                self.connection_changed.emit(self._name, True, "Reconnected")
             return self._client
 
         def _disconnect(self) -> None:
@@ -282,10 +292,10 @@ if QT_AVAILABLE:
             message = str(exc)
             if isinstance(exc, (ConnectionLostError, AuthenticationError)):
                 self._disconnect()
-                self.connection_changed.emit(False, message)
+                self.connection_changed.emit(self._name, False, message)
             logger.warning("%s failed: %s", operation, message,
                            extra={"event": "operation_failed", "operation": operation})
-            self.operation_finished.emit(operation, False, message)
+            self.operation_finished.emit(self._name, operation, False, message)
             return message
 
         # -------------------------------------------------------------- slots
@@ -303,8 +313,8 @@ if QT_AVAILABLE:
                 for folder in folders:
                     if folder.kind == "trash":
                         self._trash_folder = folder.name
-                self.folders_listed.emit(folders)
-                self.operation_finished.emit("folders", True, f"{len(folders)} folders")
+                self.folders_listed.emit(self._name, folders)
+                self.operation_finished.emit(self._name, "folders", True, f"{len(folders)} folders")
             except Exception as exc:
                 self._fail("folders", exc)
             finally:
@@ -318,9 +328,9 @@ if QT_AVAILABLE:
                     self._client or ImapClient(self._account), self._store, self._max_messages
                 )
                 loaded = synchronizer.load_from_cache(
-                    folder, limit, on_message=self.message_arrived.emit
+                    folder, limit, on_message=lambda mail: self.message_arrived.emit(self._name, mail)
                 )
-                self.cache_loaded.emit(folder, len(loaded))
+                self.cache_loaded.emit(self._name, folder, len(loaded))
             except Exception:
                 logger.debug("Cache load failed for %s", folder, exc_info=True)
 
@@ -332,7 +342,7 @@ if QT_AVAILABLE:
                 return
             self._busy = True
             self._stop_event.clear()
-            self.sync_started.emit(folder)
+            self.sync_started.emit(self._name, folder)
             try:
                 client = self._ensure_client()
                 synchronizer = FolderSynchronizer(client, self._store, self._max_messages)
@@ -340,19 +350,19 @@ if QT_AVAILABLE:
                     folder,
                     criteria,
                     should_stop=self._stop_event.is_set,
-                    on_message=self.message_arrived.emit,
-                    on_progress=lambda done, total: self.sync_progress.emit(done, total),
+                    on_message=lambda mail: self.message_arrived.emit(self._name, mail),
+                    on_progress=lambda done, total: self.sync_progress.emit(self._name, done, total),
                 )
                 for uid, flags in result.flag_updates:
-                    self.flags_changed.emit(folder, uid, flags)
+                    self.flags_changed.emit(self._name, folder, uid, flags)
                 if result.removed_uids:
-                    self.messages_removed.emit(folder, result.removed_uids)
+                    self.messages_removed.emit(self._name, folder, result.removed_uids)
                 if result.error:
-                    self.connection_changed.emit(False, result.error)
-                self.sync_finished.emit(result)
+                    self.connection_changed.emit(self._name, False, result.error)
+                self.sync_finished.emit(self._name, result)
             except Exception as exc:
                 message = self._fail("sync", exc)
-                self.sync_finished.emit(SyncResult(folder=folder, error=message))
+                self.sync_finished.emit(self._name, SyncResult(folder=folder, error=message))
             finally:
                 self._busy = False
 
@@ -372,8 +382,8 @@ if QT_AVAILABLE:
                         else:
                             current -= set(flags)   # type: ignore[arg-type]
                         self._store.update_flags(folder, uid, current)
-                        self.flags_changed.emit(folder, uid, frozenset(current))
-                self.operation_finished.emit("flags", True, "")
+                        self.flags_changed.emit(self._name, folder, uid, frozenset(current))
+                self.operation_finished.emit(self._name, "flags", True, "")
             except Exception as exc:
                 self._fail("flags", exc)
             finally:
@@ -388,9 +398,9 @@ if QT_AVAILABLE:
                 trash = None if permanent else self._trash_folder
                 client.delete(folder, uid_list, permanent=permanent, trash_folder=trash)
                 self._store.remove(folder, uid_list)
-                self.messages_removed.emit(folder, uid_list)
+                self.messages_removed.emit(self._name, folder, uid_list)
                 where = "permanently deleted" if permanent or not trash else f"moved to {trash}"
-                self.operation_finished.emit("delete", True,
+                self.operation_finished.emit(self._name, "delete", True,
                                              f"{len(uid_list)} message(s) {where}")
             except Exception as exc:
                 self._fail("delete", exc)
@@ -406,8 +416,8 @@ if QT_AVAILABLE:
                 client.move(folder, uid_list, destination)
                 for uid in uid_list:
                     self._store.move_message(folder, uid, destination)
-                self.messages_removed.emit(folder, uid_list)
-                self.operation_finished.emit("move", True,
+                self.messages_removed.emit(self._name, folder, uid_list)
+                self.operation_finished.emit(self._name, "move", True,
                                              f"{len(uid_list)} message(s) moved to {destination}")
             except Exception as exc:
                 self._fail("move", exc)
@@ -420,7 +430,7 @@ if QT_AVAILABLE:
             try:
                 client = self._ensure_client()
                 client.append(folder, bytes(raw), list(flags))  # type: ignore[arg-type]
-                self.operation_finished.emit("append", True, f"Stored in {folder}")
+                self.operation_finished.emit(self._name, "append", True, f"Stored in {folder}")
             except Exception as exc:
                 self._fail("append", exc)
             finally:
@@ -441,9 +451,10 @@ if QT_AVAILABLE:
                     mail = synchronizer._load(folder, uid, frozenset(), SyncResult(folder))
                     if mail is not None:
                         self._store.add(mail)
-                        self.message_arrived.emit(mail)
+                        self.message_arrived.emit(self._name, mail)
                 self.operation_finished.emit(
-                    "search", True, f"{len(uids)} message(s) matched on the server"
+                    self._name, "search", True,
+                    f"{len(uids)} message(s) matched on the server"
                 )
             except Exception as exc:
                 self._fail("search", exc)
@@ -471,13 +482,16 @@ if QT_AVAILABLE:
         _account_changed = Signal(object)
         _shutdown_requested = Signal()
 
-        def __init__(self, account, store: MailStore, settings, parent: Optional[QObject] = None):
+        def __init__(self, account, store: MailStore, settings,
+                     parent: Optional[QObject] = None, name: str = ""):
             super().__init__(parent)
             self._settings = settings
             self._store = store
+            self._name = name or getattr(account, "username", "") or "account"
             self._thread = QThread()
-            self._thread.setObjectName("imap-sync")
-            self.worker = SyncWorker(account, store, settings.sync.max_messages_per_folder)
+            self._thread.setObjectName(f"imap-sync-{self._name}")
+            self.worker = SyncWorker(account, store, settings.sync.max_messages_per_folder,
+                                     name=self._name)
             self.worker.moveToThread(self._thread)
 
             self._sync_requested.connect(self.worker.sync_folder)

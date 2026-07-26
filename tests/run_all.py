@@ -1,4 +1,4 @@
-"""Run every test suite.
+﻿"""Run every test suite.
 
     python tests/run_all.py            # everything
     python tests/run_all.py --no-gui   # skip the tests that open windows
@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 HEADLESS = ("test_parser.py", "test_receiver.py", "test_sender.py", "test_sync.py",
-            "test_logging.py")
+            "test_logging.py", "test_outbox_config.py")
 GUI = ("test_gui_integration.py",)
 
 

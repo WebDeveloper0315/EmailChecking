@@ -57,7 +57,81 @@ __all__ = [
 
 
 class SendError(RuntimeError):
-    """SMTP failure, already phrased for a human."""
+    """SMTP failure, already phrased for a human.
+
+    ``retryable`` marks failures that are worth queueing and trying again later
+    (the server was unreachable), as opposed to failures that will never
+    succeed unattended (bad password, rejected recipient).
+    """
+
+    def __init__(self, message: str, retryable: bool = False) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
+
+class _ConnectFailure(Exception):
+    """Internal: could not establish a session on this port/encryption pair."""
+
+    def __init__(self, message: str, original: Exception) -> None:
+        super().__init__(message)
+        self.original = original
+
+
+def probe_smtp_ports(host: str, ports: Sequence[int] = (587, 465, 25),
+                     timeout: float = 3.0) -> dict[int, bool]:
+    """Which SMTP ports of ``host`` accept a TCP connection right now.
+
+    The probes run in parallel so a diagnosis costs one timeout, not three.
+    """
+    import concurrent.futures
+
+    def probe(port: int) -> tuple[int, bool]:
+        connection = socket.socket()
+        connection.settimeout(timeout)
+        try:
+            connection.connect((host, port))
+            return port, True
+        except Exception:
+            return port, False
+        finally:
+            connection.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(ports)) as pool:
+        return dict(pool.map(probe, ports))
+
+
+def diagnose_unreachable(host: str) -> str:
+    """Explain *why* nothing could be reached, with the usual culprits.
+
+    Called only after a send has already failed, because it costs a few
+    seconds of probing.
+    """
+    reachable = probe_smtp_ports(host)
+    open_ports = [port for port, ok in reachable.items() if ok]
+    if open_ports:
+        return (f"Port {open_ports[0]} of {host} does answer - retry with that port "
+                f"in Settings → Sending.")
+
+    hint = [f"No SMTP port of {host} (587, 465, 25) accepts a connection."]
+    try:
+        control = socket.socket()
+        control.settimeout(4)
+        try:
+            control.connect(("example.com", 80))
+            hint.append("Plain internet access works, so this is a targeted block.")
+        except Exception:
+            hint.append("General internet access also fails - check the connection first.")
+        finally:
+            control.close()
+    except Exception:
+        pass
+
+    hint.append(
+        "The usual causes are a VPN whose exit forbids SMTP, an ISP that blocks "
+        "outgoing mail ports, or a corporate firewall. Try disconnecting the VPN "
+        "(or excluding this application from it) and send again."
+    )
+    return " ".join(hint)
 
 
 @dataclass
@@ -463,24 +537,60 @@ class SmtpSender:
             raise SendError("\n".join(problems))
 
         message = build_message(draft, include_bcc=False)
-        raw = message.as_bytes()
-        recipients = draft.recipients
+        return self.send_raw(
+            message.as_bytes(),
+            draft.from_address,
+            draft.recipients,
+            message_id=str(message.get("Message-ID", "")),
+        )
+
+    def send_raw(self, raw: bytes, sender: str, recipients: Sequence[str],
+                 message_id: str = "") -> SendResult:
+        """Send an already built message - also used to retry the outbox."""
+        recipients = list(recipients)
+        if not recipients:
+            raise SendError("There is no recipient.")
         logger.info("Sending message to %d recipient(s)", len(recipients),
                     extra={"event": "send", "recipients": len(recipients),
-                           "bytes": len(raw), "subject_length": len(draft.subject),
-                           **self.settings.redacted()})
+                           "bytes": len(raw), **self.settings.redacted()})
 
+        # Try the configured port first, then the other standard pairs: a
+        # network that blocks 587 often still allows 465.
+        attempts: list[tuple[int, str]] = [(self.settings.port, self.settings.security)]
+        if self.settings.auto_port_fallback:
+            attempts.extend(self.settings.alternatives())
+
+        failures: list[str] = []
+        for port, security in attempts:
+            try:
+                return self._send_via(raw, sender, recipients, message_id, port, security)
+            except _ConnectFailure as exc:
+                failures.append(f"port {port} ({security}): {exc}")
+                logger.info("SMTP port %s unusable, trying the next one", port,
+                            extra={"event": "smtp_fallback", "port": port,
+                                   "security": security})
+
+        detail = "\n".join(f"  • {line}" for line in failures)
+        raise SendError(
+            f"Cannot reach {self.settings.host}.\n{detail}\n\n"
+            f"{diagnose_unreachable(self.settings.host)}",
+            retryable=True,
+        )
+
+    def _send_via(self, raw: bytes, sender: str, recipients: list[str],
+                  message_id: str, port: int, security: str) -> SendResult:
+        """One full attempt on a specific port/encryption pair."""
         server: Optional[smtplib.SMTP] = None
         try:
-            server = self._connect()
+            server = self._connect(port, security)
             server.ehlo()
-            if self.settings.security == "starttls":
+            if security == "starttls":
                 context = ssl.create_default_context()
                 server.starttls(context=context)
                 server.ehlo()
             if self.settings.username:
                 server.login(self.settings.username, self.settings.password)
-            refused = server.sendmail(draft.from_address, recipients, raw)
+            refused = server.sendmail(sender, recipients, raw)
         except smtplib.SMTPAuthenticationError as exc:
             raise SendError(self._auth_hint(exc)) from exc
         except smtplib.SMTPRecipientsRefused as exc:
@@ -488,30 +598,25 @@ class SmtpSender:
             raise SendError(f"The server rejected these recipients: {details}") from exc
         except smtplib.SMTPSenderRefused as exc:
             raise SendError(
-                f"The server refused {draft.from_address} as sender: {exc.smtp_error!r}.\n"
+                f"The server refused {sender} as sender: {exc.smtp_error!r}.\n"
                 "Usually the From address must match the account you log in with."
             ) from exc
         except smtplib.SMTPDataError as exc:
             raise SendError(f"The server rejected the message: {exc.smtp_error!r}") from exc
         except smtplib.SMTPServerDisconnected as exc:
-            raise SendError(f"The connection to {self.settings.host} dropped: {exc}") from exc
+            raise SendError(f"The connection to {self.settings.host} dropped: {exc}",
+                            retryable=True) from exc
         except (socket.timeout, TimeoutError) as exc:
-            raise SendError(
-                f"{self.settings.host}:{self.settings.port} did not answer within "
-                f"{self.settings.timeout} seconds."
+            raise _ConnectFailure(
+                f"no answer within {self.settings.timeout} s", exc
             ) from exc
         except ssl.SSLError as exc:
-            raise SendError(
-                f"Secure connection to {self.settings.host} failed: {exc}\n"
-                "Check the port and the encryption setting "
-                "(587 = STARTTLS, 465 = SSL)."
-            ) from exc
+            raise _ConnectFailure(f"TLS handshake failed ({exc})", exc) from exc
         except socket.gaierror as exc:
-            raise SendError(f"Cannot find the SMTP server {self.settings.host}.") from exc
+            raise SendError(f"Cannot find the SMTP server {self.settings.host}.",
+                            retryable=True) from exc
         except (ConnectionRefusedError, OSError) as exc:
-            raise SendError(
-                f"Cannot reach {self.settings.host}:{self.settings.port}: {exc}"
-            ) from exc
+            raise _ConnectFailure(str(exc), exc) from exc
         finally:
             if server is not None:
                 try:
@@ -519,16 +624,15 @@ class SmtpSender:
                 except Exception:
                     pass
 
-        message_id = str(message.get("Message-ID", ""))
         logger.info("Message sent", extra={"event": "sent", "message_id": message_id,
                                            "refused": len(refused)})
         return SendResult(raw=raw, message_id=message_id, recipients=recipients, refused=refused)
 
-    def _connect(self) -> smtplib.SMTP:
-        host, port, timeout = self.settings.host, self.settings.port, self.settings.timeout
+    def _connect(self, port: int, security: str) -> smtplib.SMTP:
+        host, timeout = self.settings.host, self.settings.timeout
         if not host:
-            raise SendError("No SMTP server is configured (Settings -> Sending).")
-        if self.settings.security == "ssl":
+            raise SendError("No SMTP server is configured (Settings → Sending).")
+        if security == "ssl":
             context = ssl.create_default_context()
             return smtplib.SMTP_SSL(host, port, timeout=timeout, context=context)
         return smtplib.SMTP(host, port, timeout=timeout)
