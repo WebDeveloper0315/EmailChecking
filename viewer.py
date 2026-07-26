@@ -1,20 +1,22 @@
-"""PySide6 desktop viewer.
+"""PySide6 desktop mail client.
 
 Layout
 ------
-+--------------------------------------------------------------+
-| toolbar: filter | limit | Fetch | Open .eml | Account | search |
-+-------------------+------------------------------------------+
-| message list      | header block (From/To/Cc/Subject/Date...) |
-| (sender, subject, +------------------------------------------+
-|  preview, date)   | body (QWebEngineView, else QTextBrowser)  |
-|                   +------------------------------------------+
-|                   | attachments                              |
-+-------------------+------------------------------------------+
++---------------------------------------------------------------------------+
+| toolbar: Sync | Compose | Reply | Reply all | Forward | Delete | flags ... |
++------------+--------------------------+---------------------------------- +
+| folder     | message list             | header block                       |
+| tree with  | (sender, subject,        +----------------------------------- +
+| unread     |  preview, date, star)    | body (QtWebEngine / QTextBrowser)  |
+| counts     |                          +----------------------------------- +
+|            |                          | attachments                        |
++------------+--------------------------+------------------------------------+
+| status bar: message | progress | unread count | sync indicator              |
++---------------------------------------------------------------------------+
 
-Downloading and parsing happen in a worker thread; the UI thread only ever
-receives finished :class:`~models.Email` objects, so a 20 MB message never
-freezes the window.
+Threading: this module never performs a network call.  Everything goes through
+:class:`mail_sync.SyncController`, which owns a worker thread; results come back
+as Qt signals and are applied to the models here, on the UI thread.
 """
 
 from __future__ import annotations
@@ -23,7 +25,7 @@ import logging
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import qt_bootstrap
 
@@ -39,6 +41,7 @@ from PySide6.QtCore import (  # noqa: E402
     QSortFilterProxyModel,
     Qt,
     QThread,
+    QTimer,
     QUrl,
     Signal,
 )
@@ -57,7 +60,6 @@ from PySide6.QtGui import (  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QAbstractItemView,
     QApplication,
-    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -74,14 +76,17 @@ from PySide6.QtWidgets import (  # noqa: E402
     QMenu,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
-    QSpinBox,
     QSplitter,
     QStyle,
     QStyledItemDelegate,
     QStyleOptionViewItem,
     QTextBrowser,
     QToolBar,
+    QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -96,11 +101,15 @@ from attachment_manager import (  # noqa: E402
 )
 from config import AppSettings  # noqa: E402
 from html_processor import SanitizedHtml, build_document, sanitize_html, text_to_html  # noqa: E402
+from logging_setup import get_logger  # noqa: E402
 from mail_parser import find_inline_attachment, parse_email  # noqa: E402
-from mail_receiver import FILTERS, EmlFileSource, ImboxReceiver, ReceiveError  # noqa: E402
+from mail_receiver import FILTERS, EmlFileSource, FolderInfo  # noqa: E402
+from mail_sender import Draft, build_forward, build_reply  # noqa: E402
+from mail_storage import MailStore  # noqa: E402
+from mail_sync import SyncController  # noqa: E402
 from models import Attachment, Email, format_addresses  # noqa: E402
 
-logger = logging.getLogger(__name__)
+logger = get_logger("ui")
 
 APP_NAME = "Mail Viewer"
 
@@ -116,86 +125,57 @@ try:
 
     WEBENGINE_AVAILABLE = True
 except Exception as _exc:  # pragma: no cover - depends on environment
-    logger.info("QtWebEngine unavailable (%s); using QTextBrowser instead", _exc)
+    logging.getLogger(__name__).info(
+        "QtWebEngine unavailable (%s); using QTextBrowser instead", _exc
+    )
     WEBENGINE_AVAILABLE = False
 
 EMAIL_ROLE = int(Qt.UserRole) + 1
 SEARCH_ROLE = int(Qt.UserRole) + 2
 
+SORT_FIELDS: tuple[tuple[str, str], ...] = (
+    ("date", "Date"),
+    ("from", "Sender"),
+    ("subject", "Subject"),
+    ("size", "Size"),
+    ("unread", "Read status"),
+)
 
-# --------------------------------------------------------------------- worker
-class FetchWorker(QObject):
-    """Downloads and parses messages off the UI thread."""
-
-    message_ready = Signal(object)   # Email
-    progress = Signal(int)           # messages parsed so far
-    finished = Signal(int, str)      # count, error ("" when fine)
-
-    def __init__(self, account, criteria: str, limit: int, mark_seen: bool) -> None:
-        super().__init__()
-        self._account = account
-        self._criteria = criteria
-        self._limit = limit
-        self._mark_seen = mark_seen
-        self._stop = False
-
-    def stop(self) -> None:
-        self._stop = True
-
-    def run(self) -> None:
-        count, error = 0, ""
-        receiver = ImboxReceiver(self._account)
-        try:
-            for raw in receiver.fetch(self._criteria, self._limit, lambda: self._stop):
-                mail = parse_email(raw.raw, uid=raw.uid, source=raw.folder)
-                count += 1
-                self.message_ready.emit(mail)
-                self.progress.emit(count)
-                if self._mark_seen:
-                    receiver.mark_seen(raw.uid)
-                if self._stop:
-                    break
-        except ReceiveError as exc:
-            error = str(exc)
-        except Exception as exc:  # never let the thread die silently
-            logger.exception("Unexpected error while fetching")
-            error = f"Unexpected error: {exc}"
-        finally:
-            receiver.logout()
-        self.finished.emit(count, error)
+SEARCH_FIELDS: tuple[tuple[str, str], ...] = (
+    ("all", "Everything"),
+    ("subject", "Subject"),
+    ("from", "Sender"),
+    ("to", "Recipient"),
+    ("date", "Date"),
+    ("body", "Body"),
+    ("attachment", "Attachment name"),
+)
 
 
-class FileLoadWorker(QObject):
-    """Parses ``.eml`` files off the UI thread."""
-
-    message_ready = Signal(object)
-    finished = Signal(int, str)
-
-    def __init__(self, paths: list[str]) -> None:
-        super().__init__()
-        self._paths = paths
-
-    def run(self) -> None:
-        count, error = 0, ""
-        try:
-            for raw in EmlFileSource.read(self._paths):
-                self.message_ready.emit(parse_email(raw.raw, uid=raw.uid, source=raw.folder))
-                count += 1
-        except Exception as exc:
-            logger.exception("Failed to load .eml files")
-            error = str(exc)
-        self.finished.emit(count, error)
+def _sort_value(mail: Email, key: str):
+    if key == "from":
+        return mail.sender_short.lower()
+    if key == "subject":
+        return mail.display_subject.lower()
+    if key == "size":
+        return mail.raw_size
+    if key == "unread":
+        return (mail.is_read, mail.sort_key)
+    return mail.sort_key
 
 
 # ---------------------------------------------------------------------- model
 class MessageListModel(QAbstractListModel):
-    """Holds the fetched messages, newest first."""
+    """Sorted list of the current folder's messages, updated in place."""
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
         self._emails: list[Email] = []
-        self._blobs: dict[int, str] = {}
+        self._by_uid: dict[str, int] = {}
+        self._sort_key = "date"
+        self._descending = True
 
+    # ------------------------------------------------------------ Qt model
     def rowCount(self, parent: QModelIndex = QModelIndex()) -> int:  # noqa: N802
         return 0 if parent.isValid() else len(self._emails)
 
@@ -207,43 +187,133 @@ class MessageListModel(QAbstractListModel):
             return mail.display_subject
         if role == EMAIL_ROLE:
             return mail
-        if role == SEARCH_ROLE:
-            key = id(mail)
-            if key not in self._blobs:
-                self._blobs[key] = mail.search_blob()
-            return self._blobs[key]
         if role == Qt.ToolTipRole:
-            return (f"{mail.sender}\n{mail.display_subject}\n"
-                    f"{mail.display_date}\n\n{mail.preview(200)}")
+            return (f"{mail.sender}\n{mail.display_subject}\n{mail.display_date}\n"
+                    f"{human_size(mail.raw_size)}\n\n{mail.preview(200)}")
         return None
 
-    def add(self, mail: Email) -> None:
-        """Insert keeping the list sorted by date, newest first."""
-        position = len(self._emails)
-        for i, existing in enumerate(self._emails):
-            if mail.sort_key > existing.sort_key:
-                position = i
-                break
-        self.beginInsertRows(QModelIndex(), position, position)
-        self._emails.insert(position, mail)
-        self.endInsertRows()
+    # -------------------------------------------------------------- content
+    def set_sort(self, key: str, descending: bool) -> None:
+        if key == self._sort_key and descending == self._descending:
+            return
+        self._sort_key, self._descending = key, descending
+        self.beginResetModel()
+        self._resort()
+        self.endResetModel()
+
+    def set_messages(self, emails: Sequence[Email]) -> None:
+        self.beginResetModel()
+        self._emails = list(emails)
+        self._resort()
+        self.endResetModel()
 
     def clear(self) -> None:
-        self.beginResetModel()
-        self._emails.clear()
-        self._blobs.clear()
-        self.endResetModel()
+        self.set_messages([])
+
+    def _resort(self) -> None:
+        self._emails.sort(key=lambda m: _sort_value(m, self._sort_key),
+                          reverse=self._descending)
+        self._reindex()
+
+    def _reindex(self) -> None:
+        self._by_uid = {mail.uid: row for row, mail in enumerate(self._emails)}
+
+    def _insert_position(self, mail: Email) -> int:
+        value = _sort_value(mail, self._sort_key)
+        for row, existing in enumerate(self._emails):
+            other = _sort_value(existing, self._sort_key)
+            if (value > other) if self._descending else (value < other):
+                return row
+        return len(self._emails)
+
+    def upsert(self, mail: Email) -> None:
+        """Insert a new message or refresh an existing one, keeping the order."""
+        row = self._by_uid.get(mail.uid)
+        if row is not None and 0 <= row < len(self._emails):
+            self._emails[row] = mail
+            index = self.index(row, 0)
+            self.dataChanged.emit(index, index)
+            return
+        position = self._insert_position(mail)
+        self.beginInsertRows(QModelIndex(), position, position)
+        self._emails.insert(position, mail)
+        self._reindex()
+        self.endInsertRows()
+
+    def refresh_uid(self, uid: str) -> None:
+        row = self._by_uid.get(str(uid))
+        if row is None:
+            return
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index)
+
+    def remove_uids(self, uids: Sequence[int]) -> None:
+        for uid in uids:
+            row = self._by_uid.get(str(uid))
+            if row is None:
+                continue
+            self.beginRemoveRows(QModelIndex(), row, row)
+            del self._emails[row]
+            self._reindex()
+            self.endRemoveRows()
 
     def email_at(self, row: int) -> Optional[Email]:
         return self._emails[row] if 0 <= row < len(self._emails) else None
+
+    def row_for_uid(self, uid: str) -> int:
+        return self._by_uid.get(str(uid), -1)
 
     @property
     def emails(self) -> list[Email]:
         return list(self._emails)
 
 
+class SearchProxy(QSortFilterProxyModel):
+    """Incremental search over the loaded messages, optionally per field."""
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
+        super().__init__(parent)
+        self._query = ""
+        self._field = "all"
+        self._quick = "all"
+
+    def set_query(self, text: str) -> None:
+        self._query = (text or "").strip()
+        self.invalidateFilter()
+
+    def set_field(self, field: str) -> None:
+        self._field = field or "all"
+        if self._query:
+            self.invalidateFilter()
+
+    def set_quick_filter(self, quick: str) -> None:
+        self._quick = quick or "all"
+        self.invalidateFilter()
+
+    def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:  # noqa: N802
+        model = self.sourceModel()
+        index = model.index(row, 0, parent)
+        mail: Optional[Email] = index.data(EMAIL_ROLE)
+        if mail is None:
+            return False
+        if self._quick == "unread" and mail.is_read:
+            return False
+        if self._quick == "flagged" and not mail.is_starred:
+            return False
+        if self._quick == "today" and mail.date is not None:
+            from datetime import datetime, timezone
+
+            now = datetime.now(timezone.utc)
+            when = mail.date if mail.date.tzinfo else mail.date.replace(tzinfo=timezone.utc)
+            if (now - when).days > 0:
+                return False
+        if not self._query:
+            return True
+        return mail.matches(self._query, self._field)
+
+
 class MessageDelegate(QStyledItemDelegate):
-    """Three-line row: sender + date, subject, preview - like a mail client."""
+    """Three-line row with unread, star and attachment indicators."""
 
     PADDING = 8
 
@@ -274,50 +344,51 @@ class MessageDelegate(QStyledItemDelegate):
         metrics = QFontMetrics(option.font)
         line_height = metrics.height()
 
+        # Unread marker: a coloured bar on the left edge.
+        if not mail.is_read:
+            marker = QColor("#1a73e8") if not selected else primary
+            painter.fillRect(QRect(option.rect.left(), option.rect.top() + 6,
+                                   3, option.rect.height() - 12), marker)
+
         bold = QFont(option.font)
-        bold.setBold(True)
+        bold.setBold(not mail.is_read)
         small = QFont(option.font)
         small.setPointSizeF(max(7.0, option.font.pointSizeF() - 1))
         small_metrics = QFontMetrics(small)
 
-        # Line 1: sender (bold, left) and date (small, right).
+        # Line 1: sender (left), star + date (right).
         date_text = mail.display_date
-        date_width = small_metrics.horizontalAdvance(date_text) + 6
+        star_text = "★ " if mail.is_starred else ""
+        right_text = star_text + date_text
+        right_width = small_metrics.horizontalAdvance(right_text) + 6
         painter.setFont(small)
-        painter.setPen(secondary)
+        painter.setPen(QColor("#f5a623") if mail.is_starred and not selected else secondary)
         painter.drawText(
-            QRect(rect.right() - date_width, rect.top(), date_width, line_height),
-            int(Qt.AlignRight | Qt.AlignVCenter),
-            date_text,
+            QRect(rect.right() - right_width, rect.top(), right_width, line_height),
+            int(Qt.AlignRight | Qt.AlignVCenter), right_text,
         )
         painter.setFont(bold)
         painter.setPen(primary)
-        sender_rect = QRect(rect.left(), rect.top(), rect.width() - date_width - 6, line_height)
+        sender_rect = QRect(rect.left(), rect.top(), rect.width() - right_width - 6, line_height)
         painter.drawText(
-            sender_rect,
-            int(Qt.AlignLeft | Qt.AlignVCenter),
+            sender_rect, int(Qt.AlignLeft | Qt.AlignVCenter),
             QFontMetrics(bold).elidedText(mail.sender_short, Qt.ElideRight, sender_rect.width()),
         )
 
-        # Line 2: attachment icon (drawn, not an emoji - fonts vary) + subject.
+        # Line 2: attachment icon + subject.
         painter.setFont(option.font)
-        subject = mail.display_subject
         subject_left = rect.left()
         if mail.has_attachments:
             icon_size = line_height - 4
             icon = QApplication.style().standardIcon(QStyle.SP_FileIcon)
-            icon.paint(
-                painter,
-                QRect(rect.left(), rect.top() + line_height + 2, icon_size, icon_size),
-                Qt.AlignCenter,
-            )
+            icon.paint(painter, QRect(rect.left(), rect.top() + line_height + 2,
+                                      icon_size, icon_size), Qt.AlignCenter)
             subject_left += icon_size + 4
         subject_rect = QRect(subject_left, rect.top() + line_height,
                              rect.right() - subject_left, line_height)
         painter.drawText(
-            subject_rect,
-            int(Qt.AlignLeft | Qt.AlignVCenter),
-            metrics.elidedText(subject, Qt.ElideRight, subject_rect.width()),
+            subject_rect, int(Qt.AlignLeft | Qt.AlignVCenter),
+            metrics.elidedText(mail.display_subject, Qt.ElideRight, subject_rect.width()),
         )
 
         # Line 3: preview.
@@ -325,11 +396,9 @@ class MessageDelegate(QStyledItemDelegate):
         painter.setPen(secondary)
         preview_rect = QRect(rect.left(), rect.top() + line_height * 2, rect.width(), line_height)
         painter.drawText(
-            preview_rect,
-            int(Qt.AlignLeft | Qt.AlignVCenter),
+            preview_rect, int(Qt.AlignLeft | Qt.AlignVCenter),
             small_metrics.elidedText(mail.preview(160), Qt.ElideRight, preview_rect.width()),
         )
-
         painter.restore()
 
 
@@ -408,7 +477,6 @@ class BodyView(QWidget):
 
         if WEBENGINE_AVAILABLE:
             self._web = QWebEngineView(self)
-            # Off-the-record profile: nothing about the mail you read is cached.
             page = _MailPage(_mail_profile(), self._web)
             self._web.setPage(page)
             settings = page.settings()
@@ -434,11 +502,10 @@ class BodyView(QWidget):
         return "QtWebEngine" if self._web is not None else "QTextBrowser"
 
     def show_email(self, mail: Optional[Email], allow_remote_images: bool) -> SanitizedHtml:
-        """Render a message; returns what the sanitiser had to block."""
         self._mail = mail
         self._allow_remote = allow_remote_images
         if mail is None:
-            self._render("", SanitizedHtml(html=""))
+            self._render(build_document("", dark=_is_dark()))
             return SanitizedHtml(html="")
 
         if mail.has_html:
@@ -451,18 +518,31 @@ class BodyView(QWidget):
             result = SanitizedHtml(
                 html='<p style="color:#5f6368">This message has no readable body.</p>'
             )
-        self._render(build_document(result.html, dark=_is_dark()), result)
+        self._render(build_document(result.html, dark=_is_dark()))
         return result
 
-    def _render(self, document: str, result: SanitizedHtml) -> None:
+    def _render(self, document: str) -> None:
         if self._web is not None:
             # setContent avoids setHtml's ~2 MB limit (big inline images).
             self._web.page().setContent(
-                QByteArray(document.encode("utf-8")), "text/html;charset=utf-8", QUrl("about:blank")
+                QByteArray(document.encode("utf-8")), "text/html;charset=utf-8",
+                QUrl("about:blank"),
             )
         elif self._text is not None:
             self._text.set_mail(self._mail)
             self._text.setHtml(document)
+
+    def shutdown(self) -> None:
+        """Release the web page before the shared profile goes away.
+
+        Qt prints "Release of profile requested but WebEnginePage still not
+        deleted" when a page outlives its profile, which happens at exit unless
+        the page is destroyed explicitly.
+        """
+        if self._web is not None:
+            web, self._web = self._web, None
+            web.setParent(None)
+            web.deleteLater()
 
     def find(self, text: str) -> None:
         if self._web is not None:
@@ -474,12 +554,6 @@ class BodyView(QWidget):
                 self._text.setTextCursor(cursor)
                 self._text.find(text)
 
-    def copy_selection(self) -> None:
-        if self._web is not None:
-            self._web.page().triggerAction(QWebEnginePage.WebAction.Copy)
-        elif self._text is not None:
-            self._text.copy()
-
 
 def _open_external(url: QUrl) -> None:
     if url.scheme() in ("http", "https", "mailto", "tel", "ftp", "ftps"):
@@ -489,12 +563,7 @@ def _open_external(url: QUrl) -> None:
 
 
 def _dim(label: QLabel, alpha: int = 150) -> None:
-    """Grey out a label in a way that works in both light and dark themes.
-
-    A ``color: palette(mid)`` stylesheet looks fine on a light theme and is
-    unreadable on a dark one, so the colour is derived from the actual text
-    colour instead.
-    """
+    """Grey out a label in a way that works in both light and dark themes."""
     palette = label.palette()
     colour = palette.color(QPalette.WindowText)
     colour.setAlpha(alpha)
@@ -591,7 +660,6 @@ class HeaderPane(QWidget):
         for name, text in values.items():
             self._fields[name].setText(text)
         self._set_row_visibility(values)
-
         self._details.setPlainText("\n".join(f"{name}: {value}" for name, value in mail.headers))
 
         if mail.warnings:
@@ -661,17 +729,12 @@ class AttachmentPane(QWidget):
             self._list.addItem(item)
 
         inline_count = len(mail.inline_images) if mail else 0
-        if attachments:
-            title = f"Attachments ({len(attachments)})"
-        else:
-            title = "Attachments (none)"
+        title = f"Attachments ({len(attachments)})" if attachments else "Attachments (none)"
         if inline_count:
             title += f" · {inline_count} inline image(s)"
         self._title.setText(title)
         self._save_all_button.setEnabled(bool(attachments))
-        self.setVisible(True)
 
-    # ------------------------------------------------------------------ slots
     def _context_menu(self, position) -> None:
         item = self._list.itemAt(position)
         if item is None:
@@ -746,14 +809,11 @@ class AttachmentPane(QWidget):
         layout = QVBoxLayout(dialog)
         label = QLabel()
         screen = QGuiApplication.primaryScreen().availableGeometry()
-        label.setPixmap(
-            pixmap.scaled(
-                min(pixmap.width(), int(screen.width() * 0.8)),
-                min(pixmap.height(), int(screen.height() * 0.8)),
-                Qt.KeepAspectRatio,
-                Qt.SmoothTransformation,
-            )
-        )
+        label.setPixmap(pixmap.scaled(
+            min(pixmap.width(), int(screen.width() * 0.8)),
+            min(pixmap.height(), int(screen.height() * 0.8)),
+            Qt.KeepAspectRatio, Qt.SmoothTransformation,
+        ))
         layout.addWidget(label)
         buttons = QDialogButtonBox(QDialogButtonBox.Close)
         buttons.rejected.connect(dialog.reject)
@@ -766,177 +826,317 @@ class AttachmentPane(QWidget):
             window.statusBar().showMessage(message, 6000)
 
 
-# ---------------------------------------------------------------------- login
-class AccountDialog(QDialog):
-    """IMAP account settings."""
+# ------------------------------------------------------------------- folders
+class FolderTree(QTreeWidget):
+    """Mailbox tree with unread counts; emits the raw IMAP name on selection."""
 
-    def __init__(self, settings: AppSettings, parent: Optional[QWidget] = None) -> None:
+    folder_selected = Signal(str)
+
+    ICONS = {"inbox": "📥", "sent": "📤", "drafts": "📝", "trash": "🗑",
+             "spam": "⚠", "archive": "📦", "all": "🗂", "other": "📁"}
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Mail account")
-        self.setMinimumWidth(420)
-        self._settings = settings
-        account = settings.account
+        self.setHeaderHidden(True)
+        self.setMinimumWidth(180)
+        self.setRootIsDecorated(True)
+        self._items: dict[str, QTreeWidgetItem] = {}
+        self.itemSelectionChanged.connect(self._on_selection)
 
-        form = QFormLayout()
-        self._host = QLineEdit(account.host)
-        self._port = QSpinBox()
-        self._port.setRange(1, 65535)
-        self._port.setValue(account.port)
-        self._username = QLineEdit(account.username)
-        self._password = QLineEdit(account.password)
-        self._password.setEchoMode(QLineEdit.Password)
-        self._folder = QLineEdit(account.folder)
-        self._ssl = QCheckBox("Use SSL (port 993)")
-        self._ssl.setChecked(account.use_ssl)
-        self._starttls = QCheckBox("Use STARTTLS (port 143)")
-        self._starttls.setChecked(account.starttls)
-        self._remember = QCheckBox("Remember password in config.ini (stored in clear text)")
-        self._remember.setChecked(settings.remember_password)
-        self._mark_seen = QCheckBox("Mark messages as read after downloading")
-        self._mark_seen.setChecked(settings.mark_seen)
+    def set_folders(self, folders: Sequence[FolderInfo]) -> None:
+        current = self.current_folder()
+        self.clear()
+        self._items.clear()
 
-        form.addRow("IMAP server:", self._host)
-        form.addRow("Port:", self._port)
-        form.addRow("User name:", self._username)
-        form.addRow("Password:", self._password)
-        form.addRow("Folder:", self._folder)
-        form.addRow("", self._ssl)
-        form.addRow("", self._starttls)
-        form.addRow("", self._mark_seen)
-        form.addRow("", self._remember)
+        # Special folders first, then the rest, nested on the delimiter.
+        for folder in folders:
+            parent_item: Optional[QTreeWidgetItem] = None
+            parts = folder.name.split(folder.delimiter) if folder.delimiter else [folder.name]
+            path = ""
+            for depth, part in enumerate(parts):
+                path = f"{path}{folder.delimiter}{part}" if path else part
+                item = self._items.get(path)
+                if item is None:
+                    item = QTreeWidgetItem([part])
+                    if parent_item is None:
+                        self.addTopLevelItem(item)
+                    else:
+                        parent_item.addChild(item)
+                    self._items[path] = item
+                    item.setData(0, Qt.UserRole, path if depth == len(parts) - 1 else "")
+                parent_item = item
 
-        hint = QLabel(
-            "Gmail and Outlook need an <b>app password</b>, not your normal one.<br>"
-            "You can also set <code>MAIL_USERNAME</code> / <code>MAIL_PASSWORD</code> "
-            "in the environment instead of saving them here."
-        )
-        hint.setWordWrap(True)
-        _dim(hint)
+            item = self._items[folder.name]
+            item.setData(0, Qt.UserRole, folder.name if folder.selectable else "")
+            item.setText(0, f"{self.ICONS.get(folder.kind, '📁')}  {folder.display}")
+            self._update_count(item, folder.display, folder.kind, folder.unread)
+            item.setToolTip(0, f"{folder.name}\n{folder.total} message(s), "
+                               f"{folder.unread} unread")
 
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
+        self.expandAll()
+        if current:
+            self.select_folder(current)
 
-        layout = QVBoxLayout(self)
-        layout.addLayout(form)
-        layout.addWidget(hint)
-        layout.addWidget(buttons)
+    def _update_count(self, item: QTreeWidgetItem, display: str, kind: str, unread: int) -> None:
+        icon = self.ICONS.get(kind, "📁")
+        font = item.font(0)
+        font.setBold(unread > 0)
+        item.setFont(0, font)
+        item.setText(0, f"{icon}  {display}" + (f"  ({unread})" if unread else ""))
 
-    def accept(self) -> None:
-        account = self._settings.account
-        account.host = self._host.text().strip()
-        account.port = self._port.value()
-        account.username = self._username.text().strip()
-        account.password = self._password.text()
-        account.folder = self._folder.text().strip() or "INBOX"
-        account.use_ssl = self._ssl.isChecked()
-        account.starttls = self._starttls.isChecked()
-        self._settings.remember_password = self._remember.isChecked()
-        self._settings.mark_seen = self._mark_seen.isChecked()
-        self._settings.save()
-        super().accept()
+    def update_unread(self, folder: str, unread: int, display: str = "", kind: str = "") -> None:
+        item = self._items.get(folder)
+        if item is None:
+            return
+        text = display or item.text(0).split("  ", 1)[-1].split("  (")[0]
+        self._update_count(item, text, kind or "other", unread)
+
+    def current_folder(self) -> str:
+        items = self.selectedItems()
+        if not items:
+            return ""
+        return str(items[0].data(0, Qt.UserRole) or "")
+
+    def select_folder(self, folder: str) -> None:
+        item = self._items.get(folder)
+        if item is not None:
+            self.setCurrentItem(item)
+
+    def _on_selection(self) -> None:
+        folder = self.current_folder()
+        if folder:
+            self.folder_selected.emit(folder)
+
+
+# ------------------------------------------------------------- file loading
+class FileLoadWorker(QObject):
+    """Parses ``.eml`` files off the UI thread (kept from the viewer version)."""
+
+    message_ready = Signal(object)
+    finished = Signal(int, str)
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__()
+        self._paths = paths
+
+    def run(self) -> None:
+        count, error = 0, ""
+        try:
+            for raw in EmlFileSource.read(self._paths):
+                self.message_ready.emit(
+                    parse_email(raw.raw, uid=raw.uid, source=raw.folder, folder="(files)")
+                )
+                count += 1
+        except Exception as exc:
+            logger.exception("Failed to load .eml files")
+            error = str(exc)
+        self.finished.emit(count, error)
 
 
 # ----------------------------------------------------------------- main window
 class MainWindow(QMainWindow):
-    def __init__(self, settings: AppSettings) -> None:
+    def __init__(self, settings: AppSettings, start_offline: bool = False) -> None:
         super().__init__()
         self._settings = settings
-        self._thread: Optional[QThread] = None
-        self._worker: Optional[QObject] = None
+        #: True when the window was opened on local files: do not ask for an
+        #: account and do not start synchronising.
+        self._start_offline = start_offline
+        self._store = MailStore(
+            cache_dir=settings.sync.cache_path() if settings.sync.cache_enabled else None,
+            account_key=settings.account_key(),
+            cache_enabled=settings.sync.cache_enabled,
+            max_messages_per_folder=settings.sync.max_messages_per_folder,
+        )
+        self._folders: dict[str, FolderInfo] = {}
+        self._current_folder = settings.account.folder or "INBOX"
         self._current: Optional[Email] = None
         self._allow_remote_for_current = settings.allow_remote_images
+        self._compose_windows: list[QWidget] = []
+        self._file_thread: Optional[QThread] = None
+        self._file_worker: Optional[QObject] = None
+        self._syncing = False
 
         self.setWindowTitle(APP_NAME)
-        self.resize(1180, 760)
+        self._restore_geometry()
 
         self._model = MessageListModel(self)
-        self._proxy = QSortFilterProxyModel(self)
+        self._model.set_sort(settings.sort_key, settings.sort_descending)
+        self._proxy = SearchProxy(self)
         self._proxy.setSourceModel(self._model)
-        self._proxy.setFilterRole(SEARCH_ROLE)
-        self._proxy.setFilterCaseSensitivity(Qt.CaseInsensitive)
 
         self._build_toolbar()
         self._build_central()
-        self.statusBar().showMessage(f"Ready · rendering with {self._body.backend}")
+        self._build_status_bar()
 
-    # ---------------------------------------------------------------- widgets
+        self._controller = SyncController(settings.account, self._store, settings, self)
+        self._connect_worker()
+        if start_offline:
+            # Opened on local files: never reach for the server on a timer.
+            self._controller.apply_interval(0)
+
+        self.statusBar().showMessage(f"Ready · rendering with {self._body.backend}")
+        QTimer.singleShot(0, self._start_up)
+
+    # ---------------------------------------------------------------- set-up
+    def _restore_geometry(self) -> None:
+        window = self._settings.window
+        self.resize(max(800, window.width), max(600, window.height))
+        if window.x >= 0 and window.y >= 0:
+            self.move(window.x, window.y)
+        if window.maximized:
+            self.showMaximized()
+
     def _build_toolbar(self) -> None:
         toolbar = QToolBar("Main")
         toolbar.setMovable(False)
+        toolbar.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
         self.addToolBar(toolbar)
 
-        self._filter = QComboBox()
-        for value, label in FILTERS:
-            self._filter.addItem(label, value)
-        index = self._filter.findData(self._settings.default_filter)
-        self._filter.setCurrentIndex(max(0, index))
-        toolbar.addWidget(QLabel(" Show: "))
-        toolbar.addWidget(self._filter)
-
-        self._sender_filter = QLineEdit()
-        self._sender_filter.setPlaceholderText("from: sender@example.com (optional)")
-        self._sender_filter.setClearButtonEnabled(True)
-        self._sender_filter.setMaximumWidth(240)
-        toolbar.addWidget(self._sender_filter)
-
-        toolbar.addWidget(QLabel("  Max: "))
-        self._limit = QSpinBox()
-        self._limit.setRange(1, 1000)
-        self._limit.setValue(self._settings.fetch_limit)
-        toolbar.addWidget(self._limit)
-        toolbar.addSeparator()
-
-        self._fetch_action = QAction("Fetch mail", self)
-        self._fetch_action.setShortcut(QKeySequence("F5"))
-        self._fetch_action.triggered.connect(self.fetch_mail)
-        toolbar.addAction(self._fetch_action)
+        self._sync_action = QAction("Sync now", self)
+        self._sync_action.setShortcut(QKeySequence("F5"))
+        self._sync_action.triggered.connect(self.sync_now)
+        toolbar.addAction(self._sync_action)
 
         self._stop_action = QAction("Stop", self)
         self._stop_action.setEnabled(False)
-        self._stop_action.triggered.connect(self.stop_fetch)
+        self._stop_action.triggered.connect(lambda: self._controller.stop_current())
         toolbar.addAction(self._stop_action)
-
-        open_action = QAction("Open .eml…", self)
-        open_action.setShortcut(QKeySequence.Open)
-        open_action.triggered.connect(self.open_files)
-        toolbar.addAction(open_action)
-
-        account_action = QAction("Account…", self)
-        account_action.triggered.connect(self.edit_account)
-        toolbar.addAction(account_action)
-
         toolbar.addSeparator()
+
+        compose_action = QAction("Compose", self)
+        compose_action.setShortcut(QKeySequence("Ctrl+N"))
+        compose_action.triggered.connect(self.compose_new)
+        toolbar.addAction(compose_action)
+
+        self._reply_action = QAction("Reply", self)
+        self._reply_action.setShortcut(QKeySequence("Ctrl+R"))
+        self._reply_action.triggered.connect(lambda: self.reply(all_recipients=False))
+        toolbar.addAction(self._reply_action)
+
+        self._reply_all_action = QAction("Reply all", self)
+        self._reply_all_action.setShortcut(QKeySequence("Ctrl+Shift+R"))
+        self._reply_all_action.triggered.connect(lambda: self.reply(all_recipients=True))
+        toolbar.addAction(self._reply_all_action)
+
+        forward_button = QToolButton()
+        forward_button.setText("Forward")
+        forward_button.setPopupMode(QToolButton.MenuButtonPopup)
+        forward_menu = QMenu(forward_button)
+        forward_menu.addAction("Forward inline", lambda: self.forward(as_attachment=False))
+        forward_menu.addAction("Forward as attachment (.eml)",
+                               lambda: self.forward(as_attachment=True))
+        forward_button.setMenu(forward_menu)
+        forward_button.clicked.connect(lambda: self.forward(as_attachment=False))
+        toolbar.addWidget(forward_button)
+
+        self._delete_action = QAction("Delete", self)
+        self._delete_action.setShortcut(QKeySequence.Delete)
+        self._delete_action.triggered.connect(self.delete_selected)
+        toolbar.addAction(self._delete_action)
+        toolbar.addSeparator()
+
+        self._read_action = QAction("Mark read", self)
+        self._read_action.triggered.connect(lambda: self.set_read(True))
+        toolbar.addAction(self._read_action)
+        self._unread_action = QAction("Mark unread", self)
+        self._unread_action.triggered.connect(lambda: self.set_read(False))
+        toolbar.addAction(self._unread_action)
+        self._star_action = QAction("Star", self)
+        self._star_action.setCheckable(True)
+        self._star_action.triggered.connect(self.toggle_star)
+        toolbar.addAction(self._star_action)
+        toolbar.addSeparator()
+
         self._images_action = QAction("Show remote images", self)
         self._images_action.setCheckable(True)
         self._images_action.setChecked(self._settings.allow_remote_images)
         self._images_action.toggled.connect(self._toggle_remote_images)
         toolbar.addAction(self._images_action)
 
-        toolbar.addSeparator()
+        settings_action = QAction("Settings…", self)
+        settings_action.triggered.connect(self.open_settings)
+        toolbar.addAction(settings_action)
+
+        open_action = QAction("Open .eml…", self)
+        open_action.setShortcut(QKeySequence.Open)
+        open_action.triggered.connect(self.open_files)
+        toolbar.addAction(open_action)
+
+        # ---- second row: view controls
+        filters = QToolBar("Filters")
+        filters.setMovable(False)
+        self.addToolBarBreak()
+        self.addToolBar(filters)
+
+        filters.addWidget(QLabel(" Show: "))
+        self._filter = QComboBox()
+        for value, label in FILTERS:
+            self._filter.addItem(label, value)
+        index = self._filter.findData(self._settings.default_filter)
+        self._filter.setCurrentIndex(max(0, index))
+        self._filter.currentIndexChanged.connect(self._on_filter_changed)
+        filters.addWidget(self._filter)
+
+        filters.addWidget(QLabel("  Sort: "))
+        self._sort = QComboBox()
+        for value, label in SORT_FIELDS:
+            self._sort.addItem(label, value)
+        self._sort.setCurrentIndex(max(0, self._sort.findData(self._settings.sort_key)))
+        self._sort.currentIndexChanged.connect(self._on_sort_changed)
+        filters.addWidget(self._sort)
+
+        self._sort_direction = QToolButton()
+        self._sort_direction.setCheckable(True)
+        self._sort_direction.setChecked(self._settings.sort_descending)
+        self._sort_direction.setText("▼" if self._settings.sort_descending else "▲")
+        self._sort_direction.setToolTip("Sort direction")
+        self._sort_direction.toggled.connect(self._on_sort_changed)
+        filters.addWidget(self._sort_direction)
+
+        filters.addSeparator()
+        filters.addWidget(QLabel(" Search in: "))
+        self._search_field = QComboBox()
+        for value, label in SEARCH_FIELDS:
+            self._search_field.addItem(label, value)
+        self._search_field.currentIndexChanged.connect(
+            lambda: self._proxy.set_field(self._search_field.currentData())
+        )
+        filters.addWidget(self._search_field)
+
         self._search = QLineEdit()
         self._search.setPlaceholderText("Search messages…  (Ctrl+F)")
         self._search.setClearButtonEnabled(True)
-        self._search.setMaximumWidth(260)
-        self._search.textChanged.connect(self._proxy.setFilterFixedString)
-        toolbar.addWidget(self._search)
+        self._search.setMinimumWidth(240)
+        self._search.textChanged.connect(self._on_search_changed)
+        filters.addWidget(self._search)
 
-        search_shortcut = QAction(self)
-        search_shortcut.setShortcut(QKeySequence.Find)
-        search_shortcut.triggered.connect(self._search.setFocus)
-        self.addAction(search_shortcut)
+        server_search = QAction("Search server", self)
+        server_search.setToolTip("Ask the server for messages that are not loaded yet")
+        server_search.triggered.connect(self.search_on_server)
+        filters.addAction(server_search)
+
+        find_shortcut = QAction(self)
+        find_shortcut.setShortcut(QKeySequence.Find)
+        find_shortcut.triggered.connect(self._search.setFocus)
+        self.addAction(find_shortcut)
 
     def _build_central(self) -> None:
-        splitter = QSplitter(Qt.Horizontal)
+        self._splitter = QSplitter(Qt.Horizontal)
+
+        self._folder_tree = FolderTree()
+        self._folder_tree.folder_selected.connect(self.open_folder)
+        self._splitter.addWidget(self._folder_tree)
 
         self._list_view = QListView()
         self._list_view.setModel(self._proxy)
         self._list_view.setItemDelegate(MessageDelegate(self))
-        self._list_view.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._list_view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self._list_view.setUniformItemSizes(True)
-        self._list_view.setMinimumWidth(280)
+        self._list_view.setMinimumWidth(260)
+        self._list_view.setContextMenuPolicy(Qt.CustomContextMenu)
+        self._list_view.customContextMenuRequested.connect(self._list_context_menu)
         self._list_view.selectionModel().currentChanged.connect(self._on_selection)
-        splitter.addWidget(self._list_view)
+        self._splitter.addWidget(self._list_view)
 
         right = QWidget()
         right_layout = QVBoxLayout(right)
@@ -948,7 +1148,6 @@ class MainWindow(QMainWindow):
 
         self._banner = QLabel()
         self._banner.setWordWrap(True)
-        self._banner.setOpenExternalLinks(False)
         self._banner.setStyleSheet(
             "background:#e8f0fe; color:#174ea6; padding:5px 12px; border-top:1px solid #c6dafc;"
         )
@@ -977,13 +1176,218 @@ class MainWindow(QMainWindow):
         self._attachments = AttachmentPane(self._settings)
         right_layout.addWidget(self._attachments)
 
-        splitter.addWidget(right)
-        splitter.setStretchFactor(0, 0)
-        splitter.setStretchFactor(1, 1)
-        splitter.setSizes([330, 850])
-        self.setCentralWidget(splitter)
+        self._splitter.addWidget(right)
+        self._splitter.setStretchFactor(0, 0)
+        self._splitter.setStretchFactor(1, 0)
+        self._splitter.setStretchFactor(2, 1)
+        sizes = self._settings.window.sizes()
+        self._splitter.setSizes(sizes if len(sizes) == 3 else [200, 330, 720])
+        self.setCentralWidget(self._splitter)
 
-    # ------------------------------------------------------------------ slots
+    def _build_status_bar(self) -> None:
+        bar = self.statusBar()
+        self._progress = QProgressBar()
+        self._progress.setMaximumWidth(160)
+        self._progress.setMaximumHeight(14)
+        self._progress.hide()
+        self._unread_label = QLabel("")
+        self._sync_label = QLabel("Idle")
+        _dim(self._sync_label)
+        bar.addPermanentWidget(self._progress)
+        bar.addPermanentWidget(self._unread_label)
+        bar.addPermanentWidget(self._sync_label)
+
+    def _connect_worker(self) -> None:
+        worker = self._controller.worker
+        worker.folders_listed.connect(self._on_folders)
+        worker.message_arrived.connect(self._on_message_arrived)
+        worker.flags_changed.connect(self._on_flags_changed)
+        worker.messages_removed.connect(self._on_messages_removed)
+        worker.sync_started.connect(self._on_sync_started)
+        worker.sync_progress.connect(self._on_sync_progress)
+        worker.sync_finished.connect(self._on_sync_finished)
+        worker.operation_finished.connect(self._on_operation_finished)
+        worker.connection_changed.connect(self._on_connection_changed)
+        worker.cache_loaded.connect(
+            lambda folder, count: self.statusBar().showMessage(
+                f"{count} message(s) restored from the local cache", 5000) if count else None
+        )
+
+    def _start_up(self) -> None:
+        if self._start_offline:
+            self.statusBar().showMessage("Opened local files · not connected", 8000)
+            return
+        account = self._settings.account
+        if not account.username or not account.password:
+            self.statusBar().showMessage("No account configured - open Settings…")
+            self.open_settings()
+            account = self._settings.account
+            if not account.username or not account.password:
+                return
+        self._controller.set_target(self._current_folder, self._filter.currentData())
+        self._controller.list_folders()
+        self._controller.load_cache(self._current_folder,
+                                    self._settings.sync.max_messages_per_folder)
+        if self._settings.sync.sync_on_start:
+            self._controller.sync_now(self._current_folder, self._filter.currentData())
+
+    # -------------------------------------------------------------- folders
+    def _on_folders(self, folders: Sequence[FolderInfo]) -> None:
+        self._folders = {folder.name: folder for folder in folders}
+        self._folder_tree.set_folders(folders)
+        if self._current_folder not in self._folders and folders:
+            inbox = next((f for f in folders if f.kind == "inbox"), folders[0])
+            self._current_folder = inbox.name
+        self._folder_tree.select_folder(self._current_folder)
+        self._update_unread_label()
+
+    def open_folder(self, folder: str) -> None:
+        if not folder or folder == self._current_folder:
+            return
+        logger.info("Opening folder %s", folder, extra={"event": "open_folder", "folder": folder})
+        self._current_folder = folder
+        self._current = None
+        self._model.set_messages(self._store.messages(folder))
+        self._render_current()
+        self._controller.set_target(folder, self._filter.currentData())
+        self._controller.load_cache(folder, self._settings.sync.max_messages_per_folder)
+        self._controller.sync_now(folder, self._filter.currentData())
+        self._select_first_row()
+
+    def _folder_of_kind(self, kind: str) -> Optional[str]:
+        for folder in self._folders.values():
+            if folder.kind == kind:
+                return folder.name
+        return None
+
+    # ------------------------------------------------------------- syncing
+    def sync_now(self) -> None:
+        self._controller.sync_now(self._current_folder, self._filter.currentData())
+
+    def _on_sync_started(self, folder: str) -> None:
+        self._syncing = True
+        self._sync_label.setText(f"⟳ Syncing {folder}…")
+        self._stop_action.setEnabled(True)
+        self._progress.setRange(0, 0)
+        self._progress.show()
+
+    def _on_sync_progress(self, done: int, total: int) -> None:
+        if total > 0:
+            self._progress.setRange(0, total)
+            self._progress.setValue(done)
+        self.statusBar().showMessage(f"Downloading {done}/{total}…")
+
+    def _on_sync_finished(self, result) -> None:
+        self._syncing = False
+        self._stop_action.setEnabled(False)
+        self._progress.hide()
+        from datetime import datetime
+
+        stamp = datetime.now().strftime("%H:%M:%S")
+        if result.error:
+            self._sync_label.setText(f"⚠ Sync failed at {stamp}")
+            self.statusBar().showMessage(result.error, 15000)
+        else:
+            self._sync_label.setText(f"Last sync {stamp}")
+            summary = []
+            if result.new_messages:
+                summary.append(f"{len(result.new_messages)} new")
+            if result.flag_updates:
+                summary.append(f"{len(result.flag_updates)} updated")
+            if result.removed_uids:
+                summary.append(f"{len(result.removed_uids)} removed")
+            self.statusBar().showMessage(
+                f"Sync of {result.folder}: " + (", ".join(summary) or "no changes"), 8000
+            )
+            folder = self._folders.get(result.folder)
+            if folder is not None:
+                folder.unread = result.unread
+                folder.total = result.total
+                self._folder_tree.update_unread(result.folder, result.unread,
+                                                folder.display, folder.kind)
+        self._update_unread_label()
+
+    def _on_message_arrived(self, mail: Email) -> None:
+        if mail.folder != self._current_folder and mail.folder != "(files)":
+            return
+        scrollbar = self._list_view.verticalScrollBar()
+        at_top = scrollbar.value() == scrollbar.minimum()
+        offset = scrollbar.value()
+        selected = self._current.uid if self._current else None
+
+        self._model.upsert(mail)
+
+        # Keep the viewport where the user left it unless they are at the top,
+        # where new mail should simply appear.
+        if not at_top:
+            scrollbar.setValue(offset)
+        if selected:
+            self._reselect(selected)
+        elif self._current is None and self._model.rowCount() == 1:
+            self._select_first_row()
+        self._update_unread_label()
+
+    def _on_flags_changed(self, folder: str, uid: int, flags) -> None:
+        if folder != self._current_folder:
+            return
+        self._model.refresh_uid(str(uid))
+        if self._current is not None and self._current.uid == str(uid):
+            self._star_action.setChecked(self._current.is_starred)
+        self._update_unread_label()
+
+    def _on_messages_removed(self, folder: str, uids: Sequence[int]) -> None:
+        if folder != self._current_folder:
+            return
+        removing_current = self._current is not None and self._current.uid_number in set(uids)
+        self._model.remove_uids(list(uids))
+        if removing_current:
+            self._current = None
+            self._select_first_row()
+        self._update_unread_label()
+
+    def _on_operation_finished(self, operation: str, ok: bool, message: str) -> None:
+        if message:
+            self.statusBar().showMessage(message, 8000)
+        if not ok:
+            logger.warning("Operation %s failed: %s", operation, message)
+            if operation in ("delete", "flags", "move", "append", "search"):
+                QMessageBox.warning(self, APP_NAME, f"{operation.capitalize()} failed:\n{message}")
+
+    def _on_connection_changed(self, connected: bool, message: str) -> None:
+        self._sync_label.setText("Connected" if connected else "Disconnected")
+        if not connected and message:
+            self.statusBar().showMessage(message, 15000)
+
+    def _update_unread_label(self) -> None:
+        total, unread = self._store.counts(self._current_folder)
+        shown = self._proxy.rowCount()
+        self._unread_label.setText(f"{shown}/{total} shown · {unread} unread")
+
+    # ------------------------------------------------------------ selection
+    def _select_first_row(self) -> None:
+        if self._proxy.rowCount() > 0:
+            self._list_view.setCurrentIndex(self._proxy.index(0, 0))
+
+    def _reselect(self, uid: str) -> None:
+        row = self._model.row_for_uid(uid)
+        if row < 0:
+            return
+        proxy_index = self._proxy.mapFromSource(self._model.index(row, 0))
+        if proxy_index.isValid() and self._list_view.currentIndex() != proxy_index:
+            self._list_view.selectionModel().setCurrentIndex(
+                proxy_index, self._list_view.selectionModel().SelectionFlag.NoUpdate
+            )
+
+    def _selected_messages(self) -> list[Email]:
+        messages: list[Email] = []
+        for index in self._list_view.selectionModel().selectedIndexes():
+            mail = index.data(EMAIL_ROLE)
+            if mail is not None and mail not in messages:
+                messages.append(mail)
+        if not messages and self._current is not None:
+            messages.append(self._current)
+        return messages
+
     def _on_selection(self, current: QModelIndex, _previous: QModelIndex) -> None:
         mail: Optional[Email] = current.data(EMAIL_ROLE) if current.isValid() else None
         self._current = mail
@@ -991,8 +1395,18 @@ class MainWindow(QMainWindow):
         self._images_action.setChecked(self._allow_remote_for_current)
         self._render_current()
 
+        if mail is not None:
+            self._star_action.setChecked(mail.is_starred)
+            if self._settings.mark_seen and not mail.is_read and mail.uid_number:
+                self.set_read(True)
+
     def _render_current(self) -> None:
         mail = self._current
+        has_message = mail is not None
+        for action in (self._reply_action, self._reply_all_action, self._delete_action,
+                       self._read_action, self._unread_action, self._star_action):
+            action.setEnabled(has_message)
+
         if mail is None:
             self._header.clear()
             self._body.show_email(None, False)
@@ -1006,10 +1420,8 @@ class MainWindow(QMainWindow):
 
         notes: list[str] = []
         if result.remote_images_blocked:
-            notes.append(
-                f"{result.remote_images_blocked} remote image(s) blocked to protect your "
-                'privacy. <a href="#show">Show images</a>'
-            )
+            notes.append(f"{result.remote_images_blocked} remote image(s) blocked to protect "
+                         'your privacy. <a href="#show">Show images</a>')
         if result.trackers_removed:
             notes.append(f"{result.trackers_removed} tracking pixel(s) removed")
         if result.missing_inline_images:
@@ -1020,45 +1432,209 @@ class MainWindow(QMainWindow):
         else:
             self._banner.hide()
 
-        self.statusBar().showMessage(
-            f"{mail.display_subject} · {human_size(mail.raw_size)} · "
-            f"{len(mail.attachments)} attachment(s) · {self._body.backend}",
-            8000,
-        )
-
     def _toggle_remote_images(self, checked: bool) -> None:
         self._allow_remote_for_current = checked
         if self._current is not None:
             self._render_current()
 
-    def edit_account(self) -> None:
-        dialog = AccountDialog(self._settings, self)
-        dialog.exec()
+    # -------------------------------------------------------------- actions
+    def _list_context_menu(self, position) -> None:
+        if not self._selected_messages():
+            return
+        menu = QMenu(self)
+        menu.addAction("Reply", lambda: self.reply(False))
+        menu.addAction("Reply all", lambda: self.reply(True))
+        menu.addAction("Forward", lambda: self.forward(False))
+        menu.addSeparator()
+        menu.addAction("Mark as read", lambda: self.set_read(True))
+        menu.addAction("Mark as unread", lambda: self.set_read(False))
+        menu.addAction("Toggle star", self.toggle_star)
+        menu.addSeparator()
+        move_menu = menu.addMenu("Move to")
+        for folder in self._folders.values():
+            if folder.selectable and folder.name != self._current_folder:
+                move_menu.addAction(folder.display,
+                                    lambda checked=False, name=folder.name: self.move_to(name))
+        menu.addAction("Delete", self.delete_selected)
+        menu.exec(self._list_view.mapToGlobal(position))
 
-    # --------------------------------------------------------------- fetching
-    def fetch_mail(self) -> None:
-        if self._thread is not None:
-            QMessageBox.information(self, APP_NAME, "A download is already running.")
+    def set_read(self, read: bool) -> None:
+        messages = [m for m in self._selected_messages() if m.uid_number]
+        if not messages:
+            return
+        uids = [m.uid_number for m in messages]
+        self._controller.set_flags(self._current_folder, uids, ["\\Seen"], add=read)
+
+    def toggle_star(self) -> None:
+        messages = [m for m in self._selected_messages() if m.uid_number]
+        if not messages:
+            return
+        add = not all(m.is_starred for m in messages)
+        self._controller.set_flags(self._current_folder,
+                                   [m.uid_number for m in messages], ["\\Flagged"], add=add)
+
+    def move_to(self, destination: str) -> None:
+        messages = [m for m in self._selected_messages() if m.uid_number]
+        if not messages:
+            return
+        self._controller.move(self._current_folder, [m.uid_number for m in messages], destination)
+
+    def delete_selected(self) -> None:
+        messages = [m for m in self._selected_messages() if m.uid_number]
+        if not messages:
+            return
+        trash = self._folder_of_kind("trash")
+        in_trash = self._current_folder == trash
+
+        box = QMessageBox(self)
+        box.setWindowTitle("Delete messages")
+        box.setIcon(QMessageBox.Question)
+        count = len(messages)
+        subject = messages[0].display_subject if count == 1 else f"{count} messages"
+        if trash and not in_trash:
+            box.setText(f"Delete {subject}?")
+            box.setInformativeText(f"They can be moved to “{trash}” or removed for good.")
+            move_button = box.addButton("Move to Trash", QMessageBox.AcceptRole)
+            permanent_button = box.addButton("Delete permanently", QMessageBox.DestructiveRole)
+        else:
+            box.setText(f"Permanently delete {subject}?")
+            box.setInformativeText("This cannot be undone.")
+            move_button = None
+            permanent_button = box.addButton("Delete permanently", QMessageBox.DestructiveRole)
+        box.addButton(QMessageBox.Cancel)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is None or clicked == box.button(QMessageBox.Cancel):
+            return
+        permanent = clicked == permanent_button
+
+        uids = [m.uid_number for m in messages]
+        # Update the UI at once; the worker confirms (or reports a failure).
+        self._model.remove_uids(uids)
+        if self._current is not None and self._current.uid_number in set(uids):
+            self._current = None
+            self._render_current()
+        self._controller.delete(self._current_folder, uids, permanent=permanent)
+        logger.info("Delete requested for %d message(s)", len(uids),
+                    extra={"event": "delete_request", "folder": self._current_folder,
+                           "count": len(uids), "permanent": permanent})
+
+    # --------------------------------------------------------------- compose
+    def _identity(self) -> tuple[str, str]:
+        smtp = self._settings.smtp_settings()
+        return smtp.username or self._settings.account.username, smtp.from_name
+
+    def _open_compose(self, draft: Optional[Draft]) -> None:
+        from compose_window import ComposeWindow
+
+        window = ComposeWindow(self._settings, draft, self)
+        window.message_sent.connect(self._on_message_sent)
+        window.draft_saved.connect(self._on_draft_saved)
+        window.setAttribute(Qt.WA_DeleteOnClose, True)
+        window.destroyed.connect(lambda: self._compose_windows.remove(window)
+                                 if window in self._compose_windows else None)
+        self._compose_windows.append(window)
+        window.show()
+
+    def compose_new(self) -> None:
+        address, name = self._identity()
+        self._open_compose(Draft(from_address=address, from_name=name))
+
+    def reply(self, all_recipients: bool = False) -> None:
+        if self._current is None:
+            return
+        address, name = self._identity()
+        draft = build_reply(self._current, address, name, reply_all=all_recipients)
+        self._open_compose(draft)
+
+    def forward(self, as_attachment: bool = False) -> None:
+        if self._current is None:
+            return
+        address, name = self._identity()
+        raw = None
+        if as_attachment:
+            raw = self._store.cached_raw(self._current_folder, self._current.uid_number)
+            if raw is None:
+                self.statusBar().showMessage(
+                    "The original bytes are not cached; forwarding a rebuilt copy.", 8000
+                )
+        draft = build_forward(self._current, address, name,
+                              as_attachment=as_attachment, raw_message=raw)
+        self._open_compose(draft)
+
+    def _on_message_sent(self, result) -> None:
+        self.statusBar().showMessage(
+            f"Message sent to {len(result.recipients)} recipient(s)", 8000
+        )
+        sent_folder = self._folder_of_kind("sent")
+        if sent_folder and result is not None:
+            self._controller.append(sent_folder, result.raw, ["\\Seen"])
+
+    def _on_draft_saved(self, raw: bytes) -> None:
+        drafts = self._folder_of_kind("drafts")
+        if not drafts:
+            QMessageBox.information(self, APP_NAME,
+                                    "No Drafts folder was found on the server.")
+            return
+        self._controller.append(drafts, raw, ["\\Draft"])
+
+    # ---------------------------------------------------------------- search
+    def _on_search_changed(self, text: str) -> None:
+        self._proxy.set_query(text)
+        self._update_unread_label()
+
+    def search_on_server(self) -> None:
+        query = self._search.text().strip()
+        if not query:
+            self.statusBar().showMessage("Type something to search for first", 5000)
+            return
+        self.statusBar().showMessage(f"Searching the server for “{query}”…")
+        self._controller.search_server(self._current_folder, query)
+
+    def _on_filter_changed(self) -> None:
+        criteria = self._filter.currentData()
+        self._proxy.set_quick_filter(criteria)
+        self._settings.default_filter = criteria
+        self._controller.set_target(self._current_folder, criteria)
+        self._update_unread_label()
+
+    def _on_sort_changed(self) -> None:
+        descending = self._sort_direction.isChecked()
+        self._sort_direction.setText("▼" if descending else "▲")
+        key = self._sort.currentData()
+        self._settings.sort_key = key
+        self._settings.sort_descending = descending
+        selected = self._current.uid if self._current else None
+        self._model.set_sort(key, descending)
+        if selected:
+            self._reselect(selected)
+
+    # ----------------------------------------------------------- misc slots
+    def open_settings(self) -> None:
+        from settings_dialog import SettingsDialog
+
+        previous_interval = self._settings.sync.interval_seconds
+        previous_account = (self._settings.account.host, self._settings.account.username,
+                            self._settings.account.password)
+        dialog = SettingsDialog(self._settings, self)
+        if dialog.exec() != QDialog.Accepted:
             return
 
-        account = self._settings.account
-        if not account.username or not account.password:
-            if AccountDialog(self._settings, self).exec() != QDialog.Accepted:
-                return
-            account = self._settings.account
-            if not account.username or not account.password:
-                return
-
-        criteria = self._sender_filter.text().strip() or self._filter.currentData()
-        self._settings.fetch_limit = self._limit.value()
-        self._settings.default_filter = self._filter.currentData()
-
-        self._model.clear()
-        self._current = None
-        self._render_current()
-
-        worker = FetchWorker(account, criteria, self._limit.value(), self._settings.mark_seen)
-        self._start_worker(worker, f"Downloading ({criteria})…")
+        self._controller.apply_interval(self._settings.sync.interval_seconds)
+        current_account = (self._settings.account.host, self._settings.account.username,
+                           self._settings.account.password)
+        if current_account != previous_account:
+            self._store.clear()
+            self._model.clear()
+            self._controller.update_account(self._settings.account)
+            self._controller.list_folders()
+            self._controller.sync_now(self._current_folder, self._filter.currentData())
+        elif previous_interval != self._settings.sync.interval_seconds:
+            self.statusBar().showMessage(
+                "Refresh interval updated", 5000
+            )
+        self._images_action.setChecked(self._settings.allow_remote_images)
 
     def open_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1067,62 +1643,70 @@ class MainWindow(QMainWindow):
         )
         if not paths:
             return
+        self._current_folder = "(files)"
         self._model.clear()
-        self._start_worker(FileLoadWorker(paths), f"Loading {len(paths)} file(s)…")
+        self._start_file_worker(FileLoadWorker(paths), f"Loading {len(paths)} file(s)…")
 
-    def _start_worker(self, worker: QObject, message: str) -> None:
+    def _start_file_worker(self, worker: QObject, message: str) -> None:
         thread = QThread(self)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
-        worker.message_ready.connect(self._on_message)
-        worker.finished.connect(self._on_finished)
+        worker.message_ready.connect(self._on_message_arrived)
+        worker.finished.connect(self._on_files_loaded)
         worker.finished.connect(thread.quit)
         thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-
-        self._thread, self._worker = thread, worker
-        self._fetch_action.setEnabled(False)
-        self._stop_action.setEnabled(hasattr(worker, "stop"))
+        self._file_thread, self._file_worker = thread, worker
         self.statusBar().showMessage(message)
         thread.start()
 
-    def stop_fetch(self) -> None:
-        if self._worker is not None and hasattr(self._worker, "stop"):
-            self._worker.stop()
-            self.statusBar().showMessage("Stopping…")
-
-    def _on_message(self, mail: Email) -> None:
-        first = self._model.rowCount() == 0
-        self._model.add(mail)
-        self.statusBar().showMessage(f"{self._model.rowCount()} message(s) loaded")
-        if first:
-            index = self._proxy.index(0, 0)
-            if index.isValid():
-                self._list_view.setCurrentIndex(index)
-
-    def _on_finished(self, count: int, error: str) -> None:
-        self._thread, self._worker = None, None
-        self._fetch_action.setEnabled(True)
-        self._stop_action.setEnabled(False)
+    def _on_files_loaded(self, count: int, error: str) -> None:
+        self._file_thread, self._file_worker = None, None
         if error:
-            self.statusBar().showMessage("Download failed")
             QMessageBox.warning(self, APP_NAME, error)
-        elif count == 0:
-            self.statusBar().showMessage("No messages matched")
         else:
-            self.statusBar().showMessage(f"Done · {count} message(s)")
+            self.statusBar().showMessage(f"Loaded {count} message(s)")
+            self._select_first_row()
 
-    # ---------------------------------------------------------------- closing
+    # ---------------------------------------------------------------- close
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt API
-        if self._worker is not None and hasattr(self._worker, "stop"):
-            self._worker.stop()
-        if self._thread is not None:
-            self._thread.quit()
-            self._thread.wait(3000)
-        self._settings.fetch_limit = self._limit.value()
-        self._settings.default_filter = self._filter.currentData()
+        window = self._settings.window
+        window.maximized = self.isMaximized()
+        if not self.isMaximized():
+            window.width, window.height = self.width(), self.height()
+            window.x, window.y = self.x(), self.y()
+        window.splitter_sizes = ",".join(str(size) for size in self._splitter.sizes())
         self._settings.save()
+
+        for compose in list(self._compose_windows):
+            compose.close()
+        self._controller.shutdown()
+        if self._file_thread is not None:
+            self._file_thread.quit()
+            self._file_thread.wait(2000)
+        self._body.shutdown()
         super().closeEvent(event)
+
+
+def apply_theme(app: QApplication, theme: str) -> None:
+    """Force a light/dark palette, or leave the system default alone."""
+    if theme == "dark":
+        from PySide6.QtGui import QPalette as _Palette
+
+        palette = _Palette()
+        palette.setColor(_Palette.Window, QColor(32, 33, 36))
+        palette.setColor(_Palette.WindowText, QColor(232, 234, 237))
+        palette.setColor(_Palette.Base, QColor(24, 25, 28))
+        palette.setColor(_Palette.AlternateBase, QColor(40, 41, 45))
+        palette.setColor(_Palette.Text, QColor(232, 234, 237))
+        palette.setColor(_Palette.Button, QColor(45, 46, 50))
+        palette.setColor(_Palette.ButtonText, QColor(232, 234, 237))
+        palette.setColor(_Palette.Highlight, QColor(26, 115, 232))
+        palette.setColor(_Palette.HighlightedText, QColor(255, 255, 255))
+        app.setPalette(palette)
+    elif theme == "light":
+        app.setStyle(app.style().objectName())
+        app.setPalette(app.style().standardPalette())
 
 
 def run(settings: Optional[AppSettings] = None, eml_paths: Optional[list[str]] = None) -> int:
@@ -1131,9 +1715,11 @@ def run(settings: Optional[AppSettings] = None, eml_paths: Optional[list[str]] =
     app = QApplication.instance() or QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
     app.setOrganizationName("EmailChecking")
+    apply_theme(app, settings.theme)
 
-    window = MainWindow(settings)
+    window = MainWindow(settings, start_offline=bool(eml_paths))
     window.show()
     if eml_paths:
-        window._start_worker(FileLoadWorker(list(eml_paths)), "Loading files…")
+        window._current_folder = "(files)"
+        window._start_file_worker(FileLoadWorker(list(eml_paths)), "Loading files…")
     return app.exec()

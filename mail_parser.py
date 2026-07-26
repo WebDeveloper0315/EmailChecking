@@ -68,10 +68,18 @@ class _Collector:
 class MailParser:
     """Stateless parser; kept as a class so it can be configured/injected."""
 
-    def parse(self, raw: bytes | str, uid: str = "", source: str = "") -> Email:
+    def parse(
+        self,
+        raw: bytes | str,
+        uid: str = "",
+        source: str = "",
+        folder: str = "",
+        flags: frozenset[str] = frozenset(),
+    ) -> Email:
         """Parse raw message bytes.  Always returns an :class:`Email`."""
         data = self._as_bytes(raw)
-        mail = Email(uid=uid, raw_size=len(data), source=source)
+        mail = Email(uid=uid, raw_size=len(data), source=source,
+                     folder=folder or source, flags=frozenset(flags))
 
         try:
             message = BytesParser(policy=compat32).parsebytes(data)
@@ -126,6 +134,10 @@ class MailParser:
         mail.date_raw = decode_header_value(get("Date"))
         mail.date = parse_date(get("Date"))
         mail.message_id = decode_header_value(get("Message-ID")).strip()
+        mail.in_reply_to = decode_header_value(get("In-Reply-To")).strip()
+        mail.references = [
+            token for token in decode_header_value(get("References")).split() if token.strip()
+        ]
 
         if mail.date is None and mail.date_raw:
             mail.warnings.append(f"Unreadable Date header: {mail.date_raw!r}")
@@ -257,9 +269,28 @@ class MailParser:
         name = decode_header_value(part.get_filename()) or f"{subject or 'attached message'}.eml"
 
         def load() -> bytes:
-            if isinstance(inner, Message):
-                return inner.as_bytes()
-            return decode_part_payload(part)
+            data = inner.as_bytes() if isinstance(inner, Message) else decode_part_payload(part)
+            # A message/rfc822 part should be 7bit/8bit (RFC 2046 §5.2.1), but
+            # some clients base64 it anyway.  Python's parser then hands us a
+            # sub-message whose "body" is the encoded text, so decode it here
+            # rather than saving an unreadable .eml.
+            encoding = str(part.get("Content-Transfer-Encoding", "")).strip().lower()
+            if encoding == "base64":
+                import base64 as _base64
+                import binascii
+
+                try:
+                    return _base64.b64decode(b"".join(data.split()), validate=False)
+                except (binascii.Error, ValueError):
+                    return data
+            if encoding in ("quoted-printable", "quopri"):
+                import quopri as _quopri
+
+                try:
+                    return _quopri.decodestring(data)
+                except Exception:
+                    return data
+            return data
 
         size = 0
         try:
@@ -345,9 +376,15 @@ def _safe_display_name(filename: str, content_type: str, content_id: str = "") -
 _DEFAULT_PARSER = MailParser()
 
 
-def parse_email(raw: bytes | str, uid: str = "", source: str = "") -> Email:
+def parse_email(
+    raw: bytes | str,
+    uid: str = "",
+    source: str = "",
+    folder: str = "",
+    flags: frozenset[str] = frozenset(),
+) -> Email:
     """Module level convenience wrapper around :class:`MailParser`."""
-    return _DEFAULT_PARSER.parse(raw, uid=uid, source=source)
+    return _DEFAULT_PARSER.parse(raw, uid=uid, source=source, folder=folder, flags=flags)
 
 
 def build_cid_index(mail: Email) -> dict[str, Attachment]:

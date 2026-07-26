@@ -1,3 +1,5 @@
 config.ini
 .env
 email-check.ipynb
+cache/
+__pycache__/

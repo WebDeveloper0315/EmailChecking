@@ -203,6 +203,24 @@ class StructureTests(unittest.TestCase):
         self.assertTrue(mail.attachments[0].filename.endswith(".eml"))
         self.assertIn(b"inner body", mail.attachments[0].data)
 
+    def test_base64_encoded_message_rfc822_is_still_readable(self) -> None:
+        """Some clients base64 a message/rfc822 part, which RFC 2046 forbids."""
+        inner = build({"From": "x@y.z", "Subject": "Encoded inner"}, "inner body")
+        raw = (
+            b"From: a@b.c\r\nSubject: Fwd\r\nMIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n'
+            b"--B\r\nContent-Type: text/plain\r\n\r\nsee attached\r\n"
+            b"--B\r\nContent-Type: message/rfc822\r\n"
+            b"Content-Transfer-Encoding: base64\r\n"
+            b'Content-Disposition: attachment; filename="inner.eml"\r\n\r\n'
+            + base64.encodebytes(inner).replace(b"\n", b"\r\n") + b"\r\n"
+            b"--B--\r\n"
+        )
+        mail = parse_email(raw)
+        self.assertEqual(len(mail.attachments), 1)
+        self.assertIn(b"inner body", mail.attachments[0].data)
+        self.assertEqual(parse_email(mail.attachments[0].data).subject, "Encoded inner")
+
 
 class RobustnessTests(unittest.TestCase):
     def test_missing_headers(self) -> None:

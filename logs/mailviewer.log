@@ -1,0 +1,23 @@
+{"time": "2026-07-26T01:26:05", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Connecting to IMAP server"}
+{"time": "2026-07-26T01:26:07", "level": "INFO", "logger": "imbox.imbox", "component": "imbox", "message": "Connected to IMAP Server with user blackghost1503@gmail.com on imap.gmail.com over SSL"}
+{"time": "2026-07-26T01:26:07", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Connected"}
+{"time": "2026-07-26T01:26:10", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Listed 9 folders"}
+{"time": "2026-07-26T01:26:10", "level": "INFO", "logger": "imbox.imbox", "component": "imbox", "message": "Disconnected from IMAP Server blackghost1503@gmail.com@imap.gmail.com"}
+{"time": "2026-07-26T01:26:10", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Disconnected"}
+{"time": "2026-07-26T01:26:44", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Connecting to IMAP server"}
+{"time": "2026-07-26T01:26:46", "level": "INFO", "logger": "imbox.imbox", "component": "imbox", "message": "Connected to IMAP Server with user blackghost1503@gmail.com on imap.gmail.com over SSL"}
+{"time": "2026-07-26T01:26:46", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Connected"}
+{"time": "2026-07-26T01:26:48", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Listed 9 folders"}
+{"time": "2026-07-26T01:26:49", "level": "INFO", "logger": "imbox.imbox", "component": "imbox", "message": "Disconnected from IMAP Server blackghost1503@gmail.com@imap.gmail.com"}
+{"time": "2026-07-26T01:26:49", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Disconnected"}
+{"time": "2026-07-26T01:27:44", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Connecting to IMAP server"}
+{"time": "2026-07-26T01:27:46", "level": "INFO", "logger": "imbox.imbox", "component": "imbox", "message": "Connected to IMAP Server with user blackghost1503@gmail.com on imap.gmail.com over SSL"}
+{"time": "2026-07-26T01:27:46", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Connected"}
+{"time": "2026-07-26T01:27:49", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Listed 9 folders"}
+{"time": "2026-07-26T01:27:50", "level": "INFO", "logger": "imbox.imbox", "component": "imbox", "message": "Disconnected from IMAP Server blackghost1503@gmail.com@imap.gmail.com"}
+{"time": "2026-07-26T01:27:50", "level": "INFO", "logger": "mail.imap", "component": "imap", "message": "Disconnected"}
+{"time": "2026-07-26T01:35:13", "level": "INFO", "logger": "qt_bootstrap", "component": "qt_bootstrap", "message": "PySide6 loaded after preloading Qt libraries from C:\\Users\\victo\\miniconda3\\Lib\\site-packages\\PySide6"}
+{"time": "2026-07-26T01:35:15", "level": "INFO", "logger": "mail.sync", "component": "sync", "message": "Automatic sync every 60 s", "event": "interval", "seconds": 60}
+{"time": "2026-07-26T01:35:52", "level": "INFO", "logger": "qt_bootstrap", "component": "qt_bootstrap", "message": "PySide6 loaded after preloading Qt libraries from C:\\Users\\victo\\miniconda3\\Lib\\site-packages\\PySide6"}
+{"time": "2026-07-26T01:35:54", "level": "INFO", "logger": "mail.sync", "component": "sync", "message": "Automatic sync every 60 s", "event": "interval", "seconds": 60}
+{"time": "2026-07-26T01:35:54", "level": "INFO", "logger": "mail.sync", "component": "sync", "message": "Automatic sync disabled (manual only)", "event": "interval", "seconds": 0}

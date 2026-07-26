@@ -94,6 +94,8 @@ class Email:
     date: Optional[datetime] = None
     date_raw: str = ""
     message_id: str = ""
+    in_reply_to: str = ""
+    references: list[str] = field(default_factory=list)
     html_body: str = ""
     text_body: str = ""
     attachments: list[Attachment] = field(default_factory=list)
@@ -103,6 +105,46 @@ class Email:
     warnings: list[str] = field(default_factory=list)
     raw_size: int = 0
     source: str = ""              # IMAP folder or file path, for the status bar
+    folder: str = ""              # IMAP mailbox this message lives in
+    flags: frozenset[str] = frozenset()   # IMAP flags, e.g. {"\\Seen", "\\Flagged"}
+
+    # -------------------------------------------------------------- IMAP state
+    @property
+    def uid_number(self) -> int:
+        """Numeric IMAP UID, or 0 for messages loaded from a file."""
+        try:
+            return int(self.uid)
+        except (TypeError, ValueError):
+            return 0
+
+    @property
+    def _lower_flags(self) -> set[str]:
+        return {f.lower() for f in self.flags}
+
+    @property
+    def is_read(self) -> bool:
+        return "\\seen" in self._lower_flags
+
+    @property
+    def is_starred(self) -> bool:
+        return "\\flagged" in self._lower_flags
+
+    @property
+    def is_answered(self) -> bool:
+        return "\\answered" in self._lower_flags
+
+    @property
+    def is_draft(self) -> bool:
+        return "\\draft" in self._lower_flags
+
+    @property
+    def is_important(self) -> bool:
+        return "$important" in self._lower_flags
+
+    def with_flags(self, flags: frozenset[str]) -> "Email":
+        """Return the same message with different flags (models are shared)."""
+        self.flags = frozenset(flags)
+        return self
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -145,17 +187,49 @@ class Email:
             text = " ".join(html_to_text(self.html_body).split())
         return text[:limit]
 
+    def body_text(self) -> str:
+        """Plain-text body, rendered from HTML when there is no text part."""
+        if self.text_body:
+            return self.text_body
+        if self.html_body:
+            from html_processor import html_to_text
+
+            return html_to_text(self.html_body)
+        return ""
+
+    def field_text(self, field: str) -> str:
+        """Text used by the search box for one searchable field."""
+        if field == "subject":
+            return self.subject
+        if field == "from":
+            return format_addresses(self.from_addrs)
+        if field == "to":
+            return format_addresses(self.to_addrs) + " " + format_addresses(self.cc_addrs)
+        if field == "date":
+            return f"{self.display_date} {self.date_raw}"
+        if field == "body":
+            return self.body_text()
+        if field == "attachment":
+            return " ".join(a.filename for a in self.attachments)
+        return self.search_blob()
+
+    def matches(self, query: str, field: str = "all") -> bool:
+        """Case-insensitive substring match, used for incremental search."""
+        needle = (query or "").strip().lower()
+        if not needle:
+            return True
+        return needle in self.field_text(field).lower()
+
     def search_blob(self) -> str:
         """Everything the quick-filter box should match against."""
         parts = [
             self.subject,
             format_addresses(self.from_addrs),
             format_addresses(self.to_addrs),
-            self.text_body,
+            format_addresses(self.cc_addrs),
+            self.display_date,
+            self.date_raw,
+            self.body_text(),
         ]
-        if not self.text_body and self.html_body:
-            from html_processor import html_to_text
-
-            parts.append(html_to_text(self.html_body))
         parts.extend(a.filename for a in self.attachments)
         return "\n".join(p for p in parts if p).lower()
