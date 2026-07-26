@@ -1,0 +1,10 @@
+From: Tanaka <tanaka@example.jp>
+To: reader@example.com
+Subject: Shift-JIS body declared as us-ascii
+Date: Wed, 22 Jul 2026 18:30:00 +0900
+MIME-Version: 1.0
+Content-Type: text/plain; charset=us-ascii
+
+件名のテスト
+
+本文は Shift-JIS です。

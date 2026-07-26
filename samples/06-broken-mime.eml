@@ -1,0 +1,10 @@
+From: Broken Sender
+Subject: =?UTF-8?B?QnJva2VuIE1JTUUgc3RydWN0dXJl?=
+Date: not a real date
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="DOES-NOT-EXIST"
+
+--SOMETHING-ELSE
+Content-Type: text/plain
+
+This text is stranded outside any valid part, but should still show up.

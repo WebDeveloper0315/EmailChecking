@@ -1,0 +1,11 @@
+# Core viewer -----------------------------------------------------------------
+PySide6>=6.5            # desktop UI; includes QtWebEngine for HTML rendering
+imbox>=0.9.8            # IMAP retrieval, as used by the original script
+
+# Optional, improves charset guessing for mail with a wrong/missing charset ----
+charset-normalizer>=3.0
+chardet>=5.0
+
+# Note: MIME parsing, HTML sanitising and attachment handling use the standard
+# library only (email, html.parser, quopri, base64), so the viewer keeps working
+# if the optional packages above are missing.

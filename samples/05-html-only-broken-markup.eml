@@ -1,0 +1,8 @@
+From: Sales <sales@example.com>
+To: reader@example.com
+Subject: =?UTF-8?Q?Quote_=E2=80=93_no_plain_text_part?=
+Date: Tue, 21 Jul 2026 08:00:00 -0400
+MIME-Version: 1.0
+Content-Type: text/html; charset=iso-8859-1
+
+<div><o:p>Dear customer,<p>Our quote is <b>attached below<ul><li>Item A &ndash; 100 &euro;<li>Item B &ndash; 250 &euro;</ul><p style='position:fixed;color:#c00'>This CSS must be neutralised.<p>Café discount applies.</div>

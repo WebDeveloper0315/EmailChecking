@@ -1,0 +1,58 @@
+From: =?UTF-8?Q?Acme_Ne=C3=BCs?= <news@acme.example>
+To: Reader <reader@example.com>
+Cc: archive@example.com
+Reply-To: no-reply@acme.example
+Subject: =?UTF-8?B?WW91ciB3ZWVrbHkgZGlnZXN0IOKAkyDpgLHliIrjg4DjgqTjgrjjgqfjgrnjg4g=?=
+Date: Fri, 24 Jul 2026 09:15:00 +0200
+Message-ID: <digest-2026-07-24@acme.example>
+MIME-Version: 1.0
+Content-Type: multipart/mixed; boundary="MIXED"
+
+--MIXED
+Content-Type: multipart/related; boundary="RELATED"
+
+--RELATED
+Content-Type: multipart/alternative; boundary="ALT"
+
+--ALT
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+Weekly digest
+=3D=3D=3D=3D=3D=3D=3D=3D=3D
+
+Hello Reader,
+
+Read the full story at https://acme.example/story/42
+
+> a quoted line from last week
+
+-- 
+The Acme team
+--ALT
+Content-Type: text/html; charset=utf-8
+Content-Transfer-Encoding: quoted-printable
+
+<html><head><style>.x{color:red}</style><script>alert('this must never run')</script></head><body style=3D"font-family:Arial"><img src=3D"cid:logo@acme.example" alt=3D"Acme" width=3D"120"><h1>Weekly digest</h1><p>Hello <b>Reader</b>, here is what happened =E2=80=93 in <i>brief</i>.</p><table border=3D"1" cellpadding=3D"6"><tr><th>Topic</th><th>Reads</th></tr><tr><td>Release 2.0</td><td>1,204</td></tr><tr><td>Roadmap</td><td>877</td></tr></table><p><a href=3D"https://acme.example/story/42">Read the full story</a> or <a href=3D"javascript:steal()">this dangerous link</a>.</p><blockquote>a quoted line from last week</blockquote><img src=3D"https://tracker.example/open?id=3D42" width=3D"1" height=3D"1"><img src=3D"https://cdn.example/banner.png" width=3D"400" alt=3D"Banner"></body></html>
+--ALT--
+
+--RELATED
+Content-Type: image/png
+Content-Transfer-Encoding: base64
+Content-ID: <logo@acme.example>
+Content-Disposition: inline; filename="logo.png"
+
+iVBORw0KGgoAAAANSUhEUgAAAHgAAAA8CAIAAAAiz+n/AAAAhklEQVR4nO3QAQkAIADAMHNY09LG
+sIXCHTzA2Zhr60Lj+cEngQbdCjToVqBBtwINuhVo0K1Ag24FGnQr0KBbgQbdCjToVqBBtwINuhVo
+0K1Ag24FGnQr0KBbgQbdCjToVqBBtwINuhVo0K1Ag24FGnQr0KBbgQbdCjToVqBBtwINuhVo0K0O
+6EP8+W+ACPIAAAAASUVORK5CYII=
+--RELATED--
+
+--MIXED
+Content-Type: application/pdf
+Content-Transfer-Encoding: base64
+Content-Disposition: attachment; filename="=?UTF-8?Q?Bericht_M=C3=A4rz.pdf?="
+
+JVBERi0xLjQKMSAwIG9iajw8L1R5cGUvQ2F0YWxvZz4+ZW5kb2JqCnRyYWlsZXI8PC9Sb290IDEg
+MCBSPj4KJSVFT0YK
+--MIXED--
