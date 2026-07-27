@@ -20,7 +20,7 @@ import imaplib
 import re
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from typing import Iterable, Iterator, Optional
 
 __all__ = ["FakeMessage", "FakeIMAP", "fake_imap_server", "fake_imap_servers",
            "sample_message"]
@@ -47,6 +47,8 @@ class FakeMessage:
     raw: bytes
     flags: set[str] = field(default_factory=set)
     internaldate: str = '"24-Jul-2026 09:15:00 +0200"'
+    #: RFC 7162 per-message modification sequence, bumped on every flag change.
+    mod_sequence: int = 1
 
     @property
     def size(self) -> int:
@@ -75,13 +77,18 @@ class FakeIMAP:
         mailboxes: Optional[dict[str, list[FakeMessage]]] = None,
         username: str = "user@example.com",
         password: str = "secret",
-        capabilities: tuple[str, ...] = ("IMAP4REV1", "MOVE", "UIDPLUS", "IDLE"),
+        capabilities: tuple[str, ...] = ("IMAP4REV1", "MOVE", "UIDPLUS", "IDLE",
+                                         "CONDSTORE"),
         folder_flags: Optional[dict[str, str]] = None,
         delimiter: str = "/",
         fetch_delay: float = 0.0,
+        ignore_deletes: bool = False,
     ) -> None:
         #: Artificial per-FETCH latency, to imitate a slow server in tests.
         self.fetch_delay = fetch_delay
+        #: Answer OK to EXPUNGE/MOVE but keep the messages - some real servers
+        #: do exactly this when a folder is read-only or a label is involved.
+        self.ignore_deletes = ignore_deletes
         self.mailboxes: dict[str, list[FakeMessage]] = mailboxes or {"INBOX": []}
         self.username = username
         self.password = password
@@ -95,6 +102,7 @@ class FakeIMAP:
         self.commands: list[tuple] = []
         self.appended: list[tuple[str, bytes, Optional[str]]] = []
         self.uid_validity = 42
+        self.mod_sequence = 1
         self._next_uid = max(
             [m.uid for messages in self.mailboxes.values() for m in messages] or [0]
         ) + 1
@@ -170,6 +178,8 @@ class FakeIMAP:
             parts.append(f"UNSEEN {unseen}")
         if "UIDVALIDITY" in names:
             parts.append(f"UIDVALIDITY {self.uid_validity}")
+        if "HIGHESTMODSEQ" in names:
+            parts.append(f"HIGHESTMODSEQ {self.mod_sequence}")
         return "OK", [f'"{name}" ({" ".join(parts)})'.encode()]
 
     def append(self, mailbox: str, flags, date_time, message):
@@ -177,15 +187,45 @@ class FakeIMAP:
         name = _unquote(mailbox)
         raw = message if isinstance(message, bytes) else str(message).encode()
         parsed_flags = set(re.findall(r"\\\w+", flags or ""))
+        self.mod_sequence += 1
         self.mailboxes.setdefault(name, []).append(
-            FakeMessage(uid=self._next_uid, raw=raw, flags=parsed_flags)
+            FakeMessage(uid=self._next_uid, raw=raw, flags=parsed_flags,
+                        mod_sequence=self.mod_sequence)
         )
         self.appended.append((name, raw, flags))
         self._next_uid += 1
         return "OK", [b"[APPENDUID 42 1] APPEND completed"]
 
+    def touch_flags(self, folder: str, uid: int, add: Iterable[str] = (),
+                    remove: Iterable[str] = ()) -> None:
+        """Change flags the way a *server* does: bumping HIGHESTMODSEQ.
+
+        Tests must not poke ``message.flags`` directly - a real server always
+        raises the modification sequence, and CONDSTORE clients rely on it.
+        """
+        for message in self.mailboxes.get(folder, []):
+            if message.uid != uid:
+                continue
+            before = set(message.flags)
+            message.flags |= set(add)
+            message.flags -= set(remove)
+            if message.flags != before:
+                self.mod_sequence += 1
+                message.mod_sequence = self.mod_sequence
+            return
+
+    def add_message(self, folder: str, message: "FakeMessage") -> "FakeMessage":
+        """Deliver new mail, with a fresh modification sequence."""
+        self.mod_sequence += 1
+        message.mod_sequence = self.mod_sequence
+        self.mailboxes.setdefault(folder, []).append(message)
+        self._next_uid = max(self._next_uid, message.uid + 1)
+        return message
+
     def expunge(self):
         self._record("expunge")
+        if self.ignore_deletes:
+            return "OK", [b"EXPUNGE completed"]
         messages = self._current()
         remaining = [m for m in messages if "\\Deleted" not in m.flags]
         self.mailboxes[self.selected or "INBOX"] = remaining
@@ -208,6 +248,10 @@ class FakeIMAP:
     def _uid_fetch(self, message_set: str, spec: str):
         messages = _select_set(self._current(), message_set)
         spec_upper = spec.upper()
+        changed_since = re.search(r"CHANGEDSINCE\s+(\d+)", spec_upper)
+        if changed_since:
+            floor = int(changed_since.group(1))
+            messages = [m for m in messages if m.mod_sequence > floor]
         if self.fetch_delay and ("BODY.PEEK[]" in spec_upper or "BODY[]" in spec_upper):
             import time as _time
 
@@ -236,20 +280,26 @@ class FakeIMAP:
         parsed = set(re.findall(r"\\?\$?\w+", flags.strip("()")))
         parsed = {f if f.startswith(("\\", "$")) else "\\" + f for f in parsed}
         for message in messages:
+            before = set(message.flags)
             if command.startswith("+"):
                 message.flags |= parsed
             elif command.startswith("-"):
                 message.flags -= parsed
             else:
                 message.flags = set(parsed)
+            if message.flags != before:
+                self.mod_sequence += 1
+                message.mod_sequence = self.mod_sequence
         return "OK", [b"STORE completed"]
 
     def _uid_copy(self, message_set: str, mailbox: str):
         messages = _select_set(self._current(), message_set)
         target = self._folder(mailbox)
         for message in messages:
+            self.mod_sequence += 1
             target.append(FakeMessage(uid=self._next_uid, raw=message.raw,
-                                      flags=set(message.flags)))
+                                      flags=set(message.flags),
+                                      mod_sequence=self.mod_sequence))
             self._next_uid += 1
         return "OK", [b"COPY completed"]
 
@@ -257,6 +307,8 @@ class FakeIMAP:
         status, _ = self._uid_copy(message_set, mailbox)
         if status != "OK":
             return status, [b"MOVE failed"]
+        if self.ignore_deletes:
+            return "OK", [b"MOVE completed"]
         moved = {m.uid for m in _select_set(self._current(), message_set)}
         self.mailboxes[self.selected or "INBOX"] = [
             m for m in self._current() if m.uid not in moved
@@ -264,6 +316,8 @@ class FakeIMAP:
         return "OK", [b"MOVE completed"]
 
     def _uid_expunge(self, message_set: str):
+        if self.ignore_deletes:
+            return "OK", [b"EXPUNGE completed"]
         targets = {m.uid for m in _select_set(self._current(), message_set)}
         self.mailboxes[self.selected or "INBOX"] = [
             m for m in self._current()

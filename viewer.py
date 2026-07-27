@@ -115,6 +115,7 @@ from mail_storage import MailStore  # noqa: E402
 from mail_sync import SyncController  # noqa: E402
 from models import Attachment, Email, format_addresses  # noqa: E402
 from notifications import NotificationCenter, make_mail_icon  # noqa: E402
+import theme  # noqa: E402
 from outbox import Outbox, QueuedMessage  # noqa: E402
 
 logger = get_logger("ui")
@@ -255,6 +256,24 @@ class MessageListModel(QAbstractListModel):
         index = self.index(row, 0)
         self.dataChanged.emit(index, index)
 
+    def apply_flags(self, uid: str, flags: frozenset[str]) -> None:
+        """Update the flags of a displayed row.
+
+        The rows come from the index as independent objects, so a flag change
+        reported by the sync worker has to be written into *this* copy - just
+        repainting would show the old state (and "unstar" would star again).
+        """
+        row = self._by_uid.get(str(uid))
+        if row is None:
+            return
+        self._emails[row].flags = frozenset(flags)
+        if self._sort_key == "unread":
+            self._resort()
+            self.layoutChanged.emit()
+            return
+        index = self.index(row, 0)
+        self.dataChanged.emit(index, index)
+
     def remove_uids(self, uids: Sequence[int]) -> None:
         for uid in uids:
             row = self._by_uid.get(str(uid))
@@ -354,7 +373,7 @@ class MessageDelegate(QStyledItemDelegate):
 
         # Unread marker: a coloured bar on the left edge.
         if not mail.is_read:
-            marker = QColor("#1a73e8") if not selected else primary
+            marker = QColor(theme.current().accent) if not selected else primary
             painter.fillRect(QRect(option.rect.left(), option.rect.top() + 6,
                                    3, option.rect.height() - 12), marker)
 
@@ -370,7 +389,7 @@ class MessageDelegate(QStyledItemDelegate):
         right_text = star_text + date_text
         right_width = small_metrics.horizontalAdvance(right_text) + 6
         painter.setFont(small)
-        painter.setPen(QColor("#f5a623") if mail.is_starred and not selected else secondary)
+        painter.setPen(QColor("#e8a13a") if mail.is_starred and not selected else secondary)
         painter.drawText(
             QRect(rect.right() - right_width, rect.top(), right_width, line_height),
             int(Qt.AlignRight | Qt.AlignVCenter), right_text,
@@ -571,19 +590,20 @@ def _open_external(url: QUrl) -> None:
 
 
 def _dim(label: QLabel, alpha: int = 150) -> None:
-    """Grey out a label in a way that works in both light and dark themes."""
+    """Secondary text colour, taken from the active theme.
+
+    An alpha channel was used here before; a real muted colour is safer,
+    because some styles ignore alpha on palette roles.
+    """
     palette = label.palette()
-    colour = palette.color(QPalette.WindowText)
-    colour.setAlpha(alpha)
+    colour = QColor(theme.current().text_muted)
     palette.setColor(QPalette.WindowText, colour)
+    palette.setColor(QPalette.Text, colour)
     label.setPalette(palette)
 
 
 def _is_dark() -> bool:
-    app = QApplication.instance()
-    if app is None:
-        return False
-    return app.palette().color(QPalette.Window).lightness() < 128
+    return theme.is_dark()
 
 
 # ---------------------------------------------------------------- header pane
@@ -622,9 +642,10 @@ class HeaderPane(QWidget):
 
         self._warning = QLabel()
         self._warning.setWordWrap(True)
+        colours = theme.current()
         self._warning.setStyleSheet(
-            "background:#fff4d6; color:#7a5900; border:1px solid #f0d38a;"
-            "border-radius:4px; padding:4px 8px;"
+            f"background:{colours.warning_bg}; color:{colours.warning_text};"
+            f"border:1px solid {colours.border}; border-radius:6px; padding:5px 9px;"
         )
         self._warning.hide()
         layout.addWidget(self._warning)
@@ -645,6 +666,18 @@ class HeaderPane(QWidget):
         layout.addWidget(self._details)
 
         self.clear()
+
+    def refresh_theme(self) -> None:
+        """Re-colour the parts that carry their own stylesheet."""
+        colours = theme.current()
+        self._warning.setStyleSheet(
+            f"background:{colours.warning_bg}; color:{colours.warning_text};"
+            f"border:1px solid {colours.border}; border-radius:6px; padding:5px 9px;"
+        )
+        for row in range(self._form.rowCount()):
+            item = self._form.itemAt(row, QFormLayout.LabelRole)
+            if item is not None and isinstance(item.widget(), QLabel):
+                _dim(item.widget())
 
     def clear(self) -> None:
         self._subject.setText("")
@@ -1104,6 +1137,7 @@ class MainWindow(QMainWindow):
                 account_key=profile.key,
                 cache_enabled=self._settings.sync.cache_enabled,
                 max_messages_per_folder=self._settings.sync.max_messages_per_folder,
+                legacy_keys=profile.legacy_keys,
             )
             controller = SyncController(profile.account, store, self._settings, self,
                                         name=profile.name)
@@ -1135,6 +1169,7 @@ class MainWindow(QMainWindow):
         worker.message_arrived.connect(self._on_message_arrived)
         worker.flags_changed.connect(self._on_flags_changed)
         worker.messages_removed.connect(self._on_messages_removed)
+        worker.messages_restored.connect(self._on_messages_restored)
         worker.sync_started.connect(self._on_sync_started)
         worker.sync_progress.connect(self._on_sync_progress)
         worker.sync_finished.connect(self._on_sync_finished)
@@ -1333,8 +1368,10 @@ class MainWindow(QMainWindow):
 
         self._banner = QLabel()
         self._banner.setWordWrap(True)
+        colours = theme.current()
         self._banner.setStyleSheet(
-            "background:#e8f0fe; color:#174ea6; padding:5px 12px; border-top:1px solid #c6dafc;"
+            f"background:{colours.info_bg}; color:{colours.info_text};"
+            f"padding:6px 12px; border:0; border-top:1px solid {colours.border};"
         )
         self._banner.linkActivated.connect(lambda _: self._images_action.setChecked(True))
         self._banner.hide()
@@ -1560,8 +1597,9 @@ class MainWindow(QMainWindow):
         if account != self._current_account or folder != self._current_folder:
             self._update_unread()
             return
-        self._model.refresh_uid(str(uid))
+        self._model.apply_flags(str(uid), frozenset(flags))
         if self._current is not None and self._current.uid == str(uid):
+            self._current.flags = frozenset(flags)
             self._star_action.setChecked(self._current.is_starred)
         self._update_unread()
 
@@ -1576,11 +1614,29 @@ class MainWindow(QMainWindow):
             self._select_first_row()
         self._update_unread()
 
+    def _on_messages_restored(self, account: str, folder: str,
+                              uids: Sequence[int]) -> None:
+        """The delete/move did not take effect: show the messages again."""
+        if account != self._current_account or folder != self._current_folder:
+            return
+        store = self.store(account)
+        for uid in uids:
+            mail = store.message(folder, int(uid))
+            if mail is not None:
+                self._model.upsert(mail)
+        self._update_unread()
+
     def _on_operation_finished(self, account: str, operation: str, ok: bool,
                                message: str) -> None:
         if message:
             self.statusBar().showMessage(f"{account}: {message}" if len(self._controllers) > 1
                                          else message, 8000)
+        if ok and operation in ("delete", "move", "append"):
+            # Reconcile with the server: cheap now that a pass only asks for
+            # the difference, and it guarantees the list matches the mailbox.
+            controller = self.controller(account)
+            if controller is not None:
+                controller.sync_now(self._current_folder, self._filter.currentData())
         if not ok:
             logger.warning("Operation %s failed for %s: %s", operation, account, message)
             if operation in ("delete", "flags", "move", "append", "search"):
@@ -1640,6 +1696,11 @@ class MainWindow(QMainWindow):
 
     def _on_selection(self, current: QModelIndex, _previous: QModelIndex) -> None:
         mail: Optional[Email] = current.data(EMAIL_ROLE) if current.isValid() else None
+        if mail is not None and not mail.loaded:
+            # Rows come from the index without a MIME body; parse it now that
+            # the user actually wants to read this one.
+            mail = self.store().ensure_loaded(mail)
+            self._model.upsert(mail)
         self._current = mail
         self._allow_remote_for_current = self._settings.allow_remote_images
         self._images_action.setChecked(self._allow_remote_for_current)
@@ -1721,13 +1782,34 @@ class MainWindow(QMainWindow):
         menu.addAction("Delete", self.delete_selected)
         menu.exec(self._list_view.mapToGlobal(position))
 
+    def _apply_flags_locally(self, uids: Sequence[int], flags: Sequence[str],
+                             add: bool) -> None:
+        """Show the new state at once, before the server has answered.
+
+        Without this, clicking Star twice quickly would read the *old* state on
+        the second click and star the message again.  The worker confirms
+        afterwards, and the next sync corrects anything the server refused.
+        """
+        store = self.store()
+        for uid in uids:
+            mail = self._model.email_at(self._model.row_for_uid(str(uid)))
+            current = set(mail.flags) if mail is not None else set(
+                (store.message(self._current_folder, uid) or Email()).flags)
+            current = (current | set(flags)) if add else (current - set(flags))
+            self._model.apply_flags(str(uid), frozenset(current))
+            store.update_flags(self._current_folder, uid, current)
+            if self._current is not None and self._current.uid_number == uid:
+                self._current.flags = frozenset(current)
+        self._update_unread()
+
     def set_read(self, read: bool) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
         controller = self.controller()
         if not messages or controller is None:
             return
-        controller.set_flags(self._current_folder, [m.uid_number for m in messages],
-                             ["\\Seen"], add=read)
+        uids = [m.uid_number for m in messages]
+        self._apply_flags_locally(uids, ["\\Seen"], add=read)
+        controller.set_flags(self._current_folder, uids, ["\\Seen"], add=read)
 
     def toggle_star(self) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
@@ -1735,8 +1817,10 @@ class MainWindow(QMainWindow):
         if not messages or controller is None:
             return
         add = not all(m.is_starred for m in messages)
-        controller.set_flags(self._current_folder, [m.uid_number for m in messages],
-                             ["\\Flagged"], add=add)
+        uids = [m.uid_number for m in messages]
+        self._apply_flags_locally(uids, ["\\Flagged"], add=add)
+        controller.set_flags(self._current_folder, uids, ["\\Flagged"], add=add)
+        self._star_action.setChecked(add)
 
     def move_to(self, destination: str) -> None:
         messages = [m for m in self._selected_messages() if m.uid_number]
@@ -1782,7 +1866,8 @@ class MainWindow(QMainWindow):
         if self._current is not None and self._current.uid_number in set(uids):
             self._current = None
             self._render_current()
-        controller.delete(self._current_folder, uids, permanent=permanent)
+        controller.delete(self._current_folder, uids, permanent=permanent,
+                          trash_folder=trash or "")
         logger.info("Delete requested for %d message(s)", len(uids),
                     extra={"event": "delete_request", "account": self._current_account,
                            "folder": self._current_folder, "count": len(uids),
@@ -2006,9 +2091,23 @@ class MainWindow(QMainWindow):
 
         self._folder_tree.set_accounts([p.name for p in self._settings.profiles])
         self._images_action.setChecked(self._settings.allow_remote_images)
+        self._refresh_theme()
         self._outbox_timer.setInterval(
             max(30, self._settings.sync.outbox_retry_seconds) * 1000)
         self._update_unread()
+
+    def _refresh_theme(self) -> None:
+        """Re-apply the theme after the settings changed, without a restart."""
+        colours = theme.apply(QApplication.instance(), self._settings.theme)
+        self._banner.setStyleSheet(
+            f"background:{colours.info_bg}; color:{colours.info_text};"
+            f"padding:6px 12px; border:0; border-top:1px solid {colours.border};"
+        )
+        for label in (self._sync_label, self._outbox_label, self._unread_label):
+            _dim(label)
+        self._header.refresh_theme()
+        if self._current is not None:
+            self._render_current()      # the body document carries its own CSS
 
     def open_files(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(
@@ -2092,28 +2191,18 @@ class MainWindow(QMainWindow):
                 thread.wait(2000)
         self._notifications.shutdown()
         self._body.shutdown()
+        for store in self._stores.values():
+            store.close()
         super().closeEvent(event)
 
 
-def apply_theme(app: QApplication, theme: str) -> None:
-    """Force a light/dark palette, or leave the system default alone."""
-    if theme == "dark":
-        from PySide6.QtGui import QPalette as _Palette
+def apply_theme(app: QApplication, name: str) -> None:
+    """Apply a complete theme (style + palette + stylesheet).
 
-        palette = _Palette()
-        palette.setColor(_Palette.Window, QColor(32, 33, 36))
-        palette.setColor(_Palette.WindowText, QColor(232, 234, 237))
-        palette.setColor(_Palette.Base, QColor(24, 25, 28))
-        palette.setColor(_Palette.AlternateBase, QColor(40, 41, 45))
-        palette.setColor(_Palette.Text, QColor(232, 234, 237))
-        palette.setColor(_Palette.Button, QColor(45, 46, 50))
-        palette.setColor(_Palette.ButtonText, QColor(232, 234, 237))
-        palette.setColor(_Palette.Highlight, QColor(26, 115, 232))
-        palette.setColor(_Palette.HighlightedText, QColor(255, 255, 255))
-        app.setPalette(palette)
-    elif theme == "light":
-        app.setStyle(app.style().objectName())
-        app.setPalette(app.style().standardPalette())
+    Delegating to :mod:`theme` is what stops the native Windows style from
+    painting text with the operating system's colours instead of ours.
+    """
+    theme.apply(app, name)
 
 
 def run(settings: Optional[AppSettings] = None, eml_paths: Optional[list[str]] = None) -> int:

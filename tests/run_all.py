@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 HEADLESS = ("test_parser.py", "test_receiver.py", "test_sender.py", "test_sync.py",
-            "test_logging.py", "test_outbox_config.py")
+            "test_logging.py", "test_outbox_config.py", "test_database.py")
 GUI = ("test_gui_integration.py",)
 
 

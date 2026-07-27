@@ -11,19 +11,25 @@ Two layers:
 
 Sync algorithm (one folder, one pass)
 -------------------------------------
-1. read ``UIDVALIDITY``; if it changed, the cached UIDs are meaningless and the
-   folder is dropped;
-2. one ``UID FETCH 1:* (UID FLAGS RFC822.SIZE)`` - this gives which messages
-   exist and their flags in a single round trip, without downloading bodies;
-3. UIDs we know but the server no longer lists -> removed;
-4. UIDs known on both sides whose flags differ -> flag update (read/unread,
-   star ...), no download;
-5. UIDs we have never seen -> body downloaded (newest first, capped), or read
-   straight from the on-disk cache when a previous run already stored it.
+The local index (SQLite) remembers, per folder, ``UIDVALIDITY``, the highest UID
+ever seen and the ``HIGHESTMODSEQ`` at that moment.  A pass therefore asks the
+server only for the difference:
 
-Only steps 3-5 produce events, so a quiet mailbox costs exactly one FETCH per
-interval and the UI is never rebuilt from scratch: the selection and the scroll
-position survive because existing rows are left alone.
+1. ``UIDVALIDITY`` - if it changed, every stored UID is meaningless and the
+   folder is re-indexed from scratch;
+2. **new mail**: ``UID FETCH <highest+1>:* (UID FLAGS RFC822.SIZE)`` - the
+   server never even mentions the messages we already have;
+3. **changed flags**: ``UID FETCH 1:* (FLAGS) (CHANGEDSINCE <modseq>)``
+   (RFC 7162) - only what somebody actually touched;
+4. **deletions**: the message count is compared with the index, and the full
+   UID list is requested *only* when the two disagree;
+5. bodies are downloaded for step 2's UIDs alone, newest first and capped.
+
+A server without CONDSTORE falls back to the portable full scan
+(``UID FETCH 1:* (UID FLAGS RFC822.SIZE)``), which is still one round trip.
+
+Nothing is rebuilt in the UI: existing rows are left alone, so the selection and
+the scroll position survive a sync.
 """
 
 from __future__ import annotations
@@ -68,6 +74,8 @@ class SyncResult:
     error: str = ""
     cancelled: bool = False
     from_cache: int = 0
+    #: True when the pass only asked the server for what changed.
+    incremental: bool = False
 
     @property
     def changed(self) -> bool:
@@ -97,30 +105,47 @@ class FolderSynchronizer:
         try:
             self.client.connect()
             validity = self.client.uid_validity(folder)
-            self.store.set_validity(folder, validity)
-
-            statuses = self.client.fetch_statuses(folder)
-            server_flags = {status.uid: status.flags for status in statuses}
-            server_uids = set(server_flags)
-
-            # A quick filter (unread/today/sender) narrows what we download, but
-            # must never be read as "everything else was deleted".
-            filtered = criteria not in ("", "all", None)
-            if filtered:
-                wanted = set(self.client.search_uids(folder, criteria)) & server_uids
-            else:
-                wanted = server_uids
+            reset = self.store.set_validity(folder, validity)
 
             known = self.store.known_uids(folder)
+            highest = 0 if reset else self.store.highest_uid(folder)
+            previous_modseq = 0 if reset else self.store.mod_sequence(folder)
+            current_modseq = self.client.mod_sequence(folder)
+            filtered = criteria not in ("", "all", None)
 
+            # ---- 1. what is new -------------------------------------------
+            # With CONDSTORE and a known high-water mark we ask only for UIDs
+            # above it; that is the whole point of keeping the index on disk.
+            incremental = bool(current_modseq and highest and known and not filtered)
+            if incremental:
+                statuses = self.client.fetch_statuses(folder, uid_range=f"{highest + 1}:*")
+                result.incremental = True
+            else:
+                statuses = self.client.fetch_statuses(folder)
+            server_flags = {status.uid: status.flags for status in statuses}
+
+            if filtered:
+                wanted = set(self.client.search_uids(folder, criteria)) & set(server_flags)
+            else:
+                wanted = set(server_flags)
+
+            # ---- 2. what changed ------------------------------------------
+            if incremental and previous_modseq and current_modseq != previous_modseq:
+                for status in self.client.fetch_changed_flags(folder, previous_modseq):
+                    if self.store.update_flags(folder, status.uid, status.flags):
+                        result.flag_updates.append((status.uid, frozenset(status.flags)))
+            elif not incremental:
+                for uid in sorted(known & set(server_flags)):
+                    if self.store.update_flags(folder, uid, server_flags[uid]):
+                        result.flag_updates.append((uid, frozenset(server_flags[uid])))
+
+            # ---- 3. what disappeared --------------------------------------
             if not filtered:
-                result.removed_uids = sorted(known - server_uids)
+                result.removed_uids = self._detect_removals(
+                    folder, known, set(server_flags), incremental)
                 if result.removed_uids:
                     self.store.remove(folder, result.removed_uids)
-
-            for uid in sorted(known & server_uids):
-                if self.store.update_flags(folder, uid, server_flags[uid]):
-                    result.flag_updates.append((uid, frozenset(server_flags[uid])))
+                    known -= set(result.removed_uids)
 
             new_uids = sorted(wanted - known, reverse=True)[: self.max_messages]
             for index, uid in enumerate(new_uids, start=1):
@@ -137,12 +162,18 @@ class FolderSynchronizer:
                 if on_progress is not None:
                     on_progress(index, len(new_uids))
 
-            result.total = len(server_uids)
-            result.unread = sum(
-                1 for flags in server_flags.values()
-                if "\\seen" not in {f.lower() for f in flags}
+            indexed_total, indexed_unread = self.store.counts(folder)
+            server_total = self.client.message_count(folder)
+            result.total = server_total if server_total >= 0 else indexed_total
+            result.unread = indexed_unread
+            self.store.set_sync_state(
+                folder,
+                uid_validity=validity,
+                highest_uid=max([highest, *server_flags] or [highest]),
+                mod_sequence=current_modseq,
+                total=result.total,
+                unread=result.unread,
             )
-            self.store.mark_synced(folder, result.total, result.unread)
             if self.store.cache_enabled:
                 self.store.prune_cache(folder)
 
@@ -151,6 +182,7 @@ class FolderSynchronizer:
                 folder, len(result.new_messages), len(result.flag_updates),
                 len(result.removed_uids),
                 extra={"event": "sync_done", "folder": folder,
+                       "incremental": result.incremental,
                        "new": len(result.new_messages), "cached": result.from_cache,
                        "flags": len(result.flag_updates), "removed": len(result.removed_uids),
                        "total": result.total, "unread": result.unread},
@@ -165,6 +197,29 @@ class FolderSynchronizer:
             logger.exception("Unexpected sync error for %s", folder,
                              extra={"event": "sync_crash", "folder": folder})
         return result
+
+    def _detect_removals(self, folder: str, known: set[int], seen: set[int],
+                         incremental: bool) -> list[int]:
+        """Find messages deleted elsewhere, without listing the whole mailbox.
+
+        A full pass already knows every server UID.  An incremental pass only
+        looked at the new ones, so it compares counts first and asks for the
+        complete UID list only when they disagree - which is the only moment a
+        deletion can have happened.
+        """
+        if not incremental:
+            return sorted(known - seen)
+
+        indexed_total, _ = self.store.counts(folder)
+        server_total = self.client.message_count(folder)
+        expected = indexed_total + len(seen - known)
+        if server_total < 0 or server_total == expected:
+            return []
+
+        logger.info("Message count differs (server %s, expected %s); listing UIDs",
+                    server_total, expected,
+                    extra={"event": "removal_check", "folder": folder})
+        return sorted(known - set(self.client.all_uids(folder)))
 
     def _load(self, folder: str, uid: int, flags: frozenset[str],
               result: SyncResult) -> Optional[Email]:
@@ -185,26 +240,21 @@ class FolderSynchronizer:
 
     def load_from_cache(self, folder: str, limit: int = 0,
                         on_message: Optional[Callable[[Email], None]] = None) -> list[Email]:
-        """Show what is on disk immediately, before the network is touched."""
-        loaded: list[Email] = []
-        known = self.store.known_uids(folder)
-        for uid in self.store.cached_uids(folder)[: (limit or self.max_messages)]:
-            if uid in known:
-                continue
-            raw = self.store.cached_raw(folder, uid)
-            if raw is None:
-                continue
-            try:
-                mail = parse_email(raw, uid=str(uid), source=folder, folder=folder)
-            except Exception:
-                continue
-            self.store.add(mail)
-            loaded.append(mail)
-            if on_message is not None:
+        """Hand the UI what the index already knows, before any network call.
+
+        Nothing is parsed here: the rows come straight out of SQLite, so even a
+        folder with thousands of messages appears instantly.
+        """
+        loaded = self.store.messages(folder)
+        if limit:
+            loaded = loaded[:limit]
+        if on_message is not None:
+            for mail in loaded:
                 on_message(mail)
         if loaded:
-            logger.info("Loaded %d cached message(s) for %s", len(loaded), folder,
-                        extra={"event": "cache_load", "folder": folder, "count": len(loaded)})
+            logger.info("Restored %d message(s) for %s from the index", len(loaded), folder,
+                        extra={"event": "index_load", "folder": folder,
+                               "count": len(loaded)})
         return loaded
 
 
@@ -239,6 +289,7 @@ if QT_AVAILABLE:
         message_arrived = Signal(str, object)         # account, Email
         flags_changed = Signal(str, str, int, object)  # account, folder, uid, flags
         messages_removed = Signal(str, str, object)   # account, folder, list[int]
+        messages_restored = Signal(str, str, object)  # account, folder, list[int]
         sync_finished = Signal(str, object)           # account, SyncResult
         operation_finished = Signal(str, str, bool, str)  # account, operation, ok, message
         connection_changed = Signal(str, bool, str)   # account, connected, message
@@ -389,19 +440,38 @@ if QT_AVAILABLE:
             finally:
                 self._busy = False
 
-        @Slot(str, object, bool)
-        def delete_messages(self, folder: str, uids: object, permanent: bool) -> None:
+        @Slot(str, object, bool, str)
+        def delete_messages(self, folder: str, uids: object, permanent: bool,
+                            trash_folder: str = "") -> None:
+            """Delete, then *verify*.
+
+            The row is only dropped once the server confirms the message is
+            gone; if it is still there the UI is told to put it back, instead of
+            showing a mailbox that does not match the server.
+            """
             self._busy = True
             try:
                 client = self._ensure_client()
                 uid_list = [int(u) for u in uids]  # type: ignore[union-attr]
-                trash = None if permanent else self._trash_folder
-                client.delete(folder, uid_list, permanent=permanent, trash_folder=trash)
-                self._store.remove(folder, uid_list)
-                self.messages_removed.emit(self._name, folder, uid_list)
-                where = "permanently deleted" if permanent or not trash else f"moved to {trash}"
-                self.operation_finished.emit(self._name, "delete", True,
-                                             f"{len(uid_list)} message(s) {where}")
+                trash = None if permanent else (trash_folder or self._trash_folder)
+                ok, remaining = client.delete(folder, uid_list, permanent=permanent,
+                                              trash_folder=trash)
+                still_there = set(remaining)
+                gone = [uid for uid in uid_list if uid not in still_there]
+                if gone:
+                    self._store.remove(folder, gone)
+                    self.messages_removed.emit(self._name, folder, gone)
+                if ok:
+                    where = ("permanently deleted" if permanent or not trash
+                             else "moved to " + str(trash))
+                    self.operation_finished.emit(self._name, "delete", True,
+                                                 f"{len(gone)} message(s) {where}")
+                else:
+                    self.messages_restored.emit(self._name, folder, remaining)
+                    self.operation_finished.emit(
+                        self._name, "delete", False,
+                        f"The server kept {len(remaining)} message(s); the mailbox was "
+                        f"not changed.")
             except Exception as exc:
                 self._fail("delete", exc)
             finally:
@@ -413,12 +483,23 @@ if QT_AVAILABLE:
             try:
                 client = self._ensure_client()
                 uid_list = [int(u) for u in uids]  # type: ignore[union-attr]
-                client.move(folder, uid_list, destination)
-                for uid in uid_list:
+                ok, remaining = client.move(folder, uid_list, destination)
+                still_there = set(remaining)
+                moved = [uid for uid in uid_list if uid not in still_there]
+                for uid in moved:
                     self._store.move_message(folder, uid, destination)
-                self.messages_removed.emit(self._name, folder, uid_list)
-                self.operation_finished.emit(self._name, "move", True,
-                                             f"{len(uid_list)} message(s) moved to {destination}")
+                if moved:
+                    self.messages_removed.emit(self._name, folder, moved)
+                if ok:
+                    self.operation_finished.emit(
+                        self._name, "move", True,
+                        f"{len(moved)} message(s) moved to {destination}")
+                else:
+                    self.messages_restored.emit(self._name, folder, remaining)
+                    self.operation_finished.emit(
+                        self._name, "move", False,
+                        f"The server did not move {len(remaining)} message(s) to "
+                        f"{destination}.")
             except Exception as exc:
                 self._fail("move", exc)
             finally:
@@ -475,7 +556,7 @@ if QT_AVAILABLE:
         _folders_requested = Signal()
         _cache_requested = Signal(str, int)
         _flags_requested = Signal(str, object, object, bool)
-        _delete_requested = Signal(str, object, bool)
+        _delete_requested = Signal(str, object, bool, str)
         _move_requested = Signal(str, object, str)
         _append_requested = Signal(str, object, object)
         _search_requested = Signal(str, str)
@@ -549,8 +630,9 @@ if QT_AVAILABLE:
                       add: bool = True) -> None:
             self._flags_requested.emit(folder, list(uids), list(flags), bool(add))
 
-        def delete(self, folder: str, uids: Sequence[int], permanent: bool = False) -> None:
-            self._delete_requested.emit(folder, list(uids), bool(permanent))
+        def delete(self, folder: str, uids: Sequence[int], permanent: bool = False,
+                   trash_folder: str = "") -> None:
+            self._delete_requested.emit(folder, list(uids), bool(permanent), trash_folder)
 
         def move(self, folder: str, uids: Sequence[int], destination: str) -> None:
             self._move_requested.emit(folder, list(uids), destination)

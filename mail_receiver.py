@@ -554,15 +554,86 @@ class ImapClient:
             return []
         return sorted(int(part) for part in _as_bytes(data[0]).split() if part.isdigit())
 
-    def fetch_statuses(self, folder: str, uids: Optional[Iterable[int]] = None) -> list[MessageStatus]:
-        """UID + FLAGS + size for a whole folder in one round trip.
+    def message_count(self, folder: str) -> int:
+        """How many messages the server holds - one cheap STATUS command."""
+        try:
+            status, data = self.connection.status(quote_mailbox(folder), "(MESSAGES)")
+            if status == "OK" and data:
+                match = re.search(r"MESSAGES\s+(\d+)",
+                                  _as_bytes(data[0]).decode("utf-8", "replace"),
+                                  re.IGNORECASE)
+                if match:
+                    return int(match.group(1))
+        except Exception:
+            logger.debug("STATUS (MESSAGES) failed for %s", folder, exc_info=True)
+        return -1
 
-        This is what makes incremental sync cheap: bodies are only downloaded
-        for UIDs we have never seen, and flag changes are detected without
-        downloading anything at all.
+    def mod_sequence(self, folder: str) -> int:
+        """``HIGHESTMODSEQ`` (RFC 7162), or 0 when the server has no CONDSTORE.
+
+        With it, "what changed since last time" is one command instead of a
+        scan of the whole mailbox.
+        """
+        if not self.has_capability("CONDSTORE"):
+            return 0
+        try:
+            status, data = self.connection.status(quote_mailbox(folder), "(HIGHESTMODSEQ)")
+            if status == "OK" and data:
+                match = re.search(r"HIGHESTMODSEQ\s+(\d+)",
+                                  _as_bytes(data[0]).decode("utf-8", "replace"),
+                                  re.IGNORECASE)
+                if match:
+                    return int(match.group(1))
+        except Exception:
+            logger.debug("HIGHESTMODSEQ unavailable for %s", folder, exc_info=True)
+        return 0
+
+    def fetch_changed_flags(self, folder: str, since: int) -> list[MessageStatus]:
+        """Only the messages whose flags changed since ``since`` (CONDSTORE)."""
+        if since <= 0 or not self.has_capability("CONDSTORE"):
+            return []
+        self.select(folder)
+        try:
+            status, data = self.connection.uid(
+                "FETCH", "1:*", f"(UID FLAGS) (CHANGEDSINCE {int(since)})"
+            )
+        except Exception as exc:
+            raise _translate(exc, self.account) from exc
+        if status != "OK" or not data:
+            return []
+        changed: list[MessageStatus] = []
+        for item in data:
+            parsed = _parse_status_line(_as_bytes(item))
+            if parsed is not None:
+                changed.append(parsed)
+        logger.info("CONDSTORE reported %d changed message(s) in %s", len(changed), folder,
+                    extra={"event": "condstore", "folder": folder,
+                           "since": since, "changed": len(changed)})
+        return changed
+
+    def all_uids(self, folder: str) -> list[int]:
+        """Every UID in the folder - used to spot messages deleted elsewhere."""
+        return self.search_raw(folder, "ALL")
+
+    def present_uids(self, folder: str, uids: Sequence[int]) -> set[int]:
+        """Which of these UIDs the server still has (used to verify a delete)."""
+        if not uids:
+            return set()
+        return {status.uid for status in self.fetch_statuses(folder, uids)}
+
+    def fetch_statuses(self, folder: str, uids: Optional[Iterable[int]] = None,
+                       uid_range: str = "") -> list[MessageStatus]:
+        """UID + FLAGS + size in one round trip.
+
+        ``uid_range`` accepts an IMAP range such as ``"1201:*"``, which is how
+        an incremental sync asks only for messages newer than everything it has
+        already seen.
         """
         self.select(folder)
-        message_set = _uid_set(uids) if uids is not None else "1:*"
+        if uid_range:
+            message_set = uid_range
+        else:
+            message_set = _uid_set(uids) if uids is not None else "1:*"
         if not message_set:
             return []
         try:
@@ -648,52 +719,75 @@ class ImapClient:
         return self.store_flags(folder or self._selected or "INBOX", [int(uid)], ["\\Seen"], True)
 
     # ------------------------------------------------------- delete and move
-    def move(self, folder: str, uids: Sequence[int], destination: str) -> bool:
-        """Move messages, preferring the atomic MOVE extension (RFC 6851)."""
+    def move(self, folder: str, uids: Sequence[int],
+             destination: str) -> tuple[bool, list[int]]:
+        """Move messages, preferring the atomic MOVE extension (RFC 6851).
+
+        Returns ``(ok, still_there)``; the source folder is re-checked so a
+        server that accepts the command without acting on it is caught.
+        """
         if not uids:
-            return True
+            return True, []
         self.select(folder)
         message_set = _uid_set(uids)
         try:
+            moved = False
             if self.has_capability("MOVE"):
                 status, _ = self.connection.uid("MOVE", message_set, quote_mailbox(destination))
-                if status == "OK":
-                    logger.info("Moved %d message(s) %s -> %s", len(uids), folder, destination,
-                                extra={"event": "move", "folder": folder,
-                                       "destination": destination, "count": len(uids)})
-                    return True
-                logger.warning("MOVE failed, falling back to COPY+DELETE")
+                moved = status == "OK"
+                if not moved:
+                    logger.warning("MOVE failed, falling back to COPY+DELETE")
 
-            status, _ = self.connection.uid("COPY", message_set, quote_mailbox(destination))
-            if status != "OK":
-                return False
-            self.connection.uid("STORE", message_set, "+FLAGS.SILENT", "(\\Deleted)")
-            self._expunge(uids)
-            logger.info("Copied+deleted %d message(s) %s -> %s", len(uids), folder, destination,
-                        extra={"event": "move_fallback", "folder": folder,
-                               "destination": destination, "count": len(uids)})
-            return True
+            if not moved:
+                status, data = self.connection.uid(
+                    "COPY", message_set, quote_mailbox(destination))
+                if status != "OK":
+                    detail = _as_bytes(data[0] if data else b"").decode("utf-8", "replace")
+                    logger.warning("COPY to %s failed: %s", destination, detail)
+                    return False, list(uids)
+                self.connection.uid("STORE", message_set, "+FLAGS.SILENT", "(\\Deleted)")
+                self._expunge(uids)
+
+            remaining = sorted(self.present_uids(folder, uids))
+            logger.info("Moved %d message(s) %s -> %s (%d left behind)",
+                        len(uids) - len(remaining), folder, destination, len(remaining),
+                        extra={"event": "move", "folder": folder,
+                               "destination": destination, "count": len(uids),
+                               "remaining": remaining[:20]})
+            return not remaining, remaining
         except Exception as exc:
             raise _translate(exc, self.account) from exc
 
     def delete(self, folder: str, uids: Sequence[int], permanent: bool = False,
-               trash_folder: Optional[str] = None) -> bool:
-        """Move to Trash, or expunge for good when ``permanent`` is set."""
+               trash_folder: Optional[str] = None) -> tuple[bool, list[int]]:
+        """Move to Trash, or expunge for good when ``permanent`` is set.
+
+        Returns ``(ok, still_there)``.  The server is asked afterwards whether
+        the messages really went away: several servers (Gmail in particular)
+        answer OK to a STORE/EXPUNGE that does not remove anything, and the old
+        code reported success regardless, so the row vanished from the list
+        while the mail was still in the mailbox.
+        """
         if not uids:
-            return True
+            return True, []
         if not permanent and trash_folder and trash_folder != folder:
             return self.move(folder, uids, trash_folder)
 
         self.select(folder)
         try:
-            self.connection.uid("STORE", _uid_set(uids), "+FLAGS.SILENT", "(\\Deleted)")
+            status, _ = self.connection.uid(
+                "STORE", _uid_set(uids), "+FLAGS.SILENT", "(\\Deleted)")
+            if status != "OK":
+                return False, list(uids)
             self._expunge(uids)
+            remaining = sorted(self.present_uids(folder, uids))
         except Exception as exc:
             raise _translate(exc, self.account) from exc
-        logger.info("Permanently deleted %d message(s) from %s", len(uids), folder,
-                    extra={"event": "delete", "folder": folder,
-                           "count": len(uids), "permanent": True})
-        return True
+        logger.info("Deleted %d message(s) from %s (%d left behind)",
+                    len(uids) - len(remaining), folder, len(remaining),
+                    extra={"event": "delete", "folder": folder, "count": len(uids),
+                           "permanent": True, "remaining": remaining[:20]})
+        return not remaining, remaining
 
     def _expunge(self, uids: Sequence[int]) -> None:
         """UID EXPUNGE when available - a plain EXPUNGE would also remove

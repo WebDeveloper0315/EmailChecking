@@ -108,6 +108,14 @@ class Email:
     folder: str = ""              # IMAP mailbox this message lives in
     flags: frozenset[str] = frozenset()   # IMAP flags, e.g. {"\\Seen", "\\Flagged"}
 
+    # ---- summary mode ------------------------------------------------------
+    # A message restored from the index has only what the list needs; the MIME
+    # body is parsed on demand when it is opened.  ``loaded`` says which it is.
+    loaded: bool = True
+    preview_text: str = ""        # snippet stored in the index
+    search_text: str = ""         # pre-computed search blob from the index
+    attachment_count: int = 0     # attachment count known without parsing
+
     # -------------------------------------------------------------- IMAP state
     @property
     def uid_number(self) -> int:
@@ -176,15 +184,19 @@ class Email:
 
     @property
     def has_attachments(self) -> bool:
-        return bool(self.attachments)
+        return bool(self.attachments) or self.attachment_count > 0
 
     def preview(self, limit: int = 120) -> str:
         """Short one-line snippet for the message list."""
+        if not self.loaded and self.preview_text:
+            return self.preview_text[:limit]
         text = " ".join(self.text_body.split())
         if not text and self.html_body:
             from html_processor import html_to_text  # local import: avoid cycle
 
             text = " ".join(html_to_text(self.html_body).split())
+        if not text:
+            return self.preview_text[:limit]
         return text[:limit]
 
     def body_text(self) -> str:
@@ -195,7 +207,9 @@ class Email:
             from html_processor import html_to_text
 
             return html_to_text(self.html_body)
-        return ""
+        # Summary from the index: the stored snippet is all we have until the
+        # message is opened and its MIME body parsed.
+        return self.preview_text
 
     def field_text(self, field: str) -> str:
         """Text used by the search box for one searchable field."""
@@ -210,7 +224,9 @@ class Email:
         if field == "body":
             return self.body_text()
         if field == "attachment":
-            return " ".join(a.filename for a in self.attachments)
+            if self.attachments or self.loaded:
+                return " ".join(a.filename for a in self.attachments)
+            return self.search_text
         return self.search_blob()
 
     def matches(self, query: str, field: str = "all") -> bool:
@@ -222,6 +238,8 @@ class Email:
 
     def search_blob(self) -> str:
         """Everything the quick-filter box should match against."""
+        if not self.loaded and self.search_text:
+            return self.search_text
         parts = [
             self.subject,
             format_addresses(self.from_addrs),

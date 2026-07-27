@@ -12,7 +12,7 @@ python main.py                      # the client
 python main.py --check              # verify IMAP + SMTP configuration, then exit
 python main.py --eml-dir samples    # open local .eml files, no account needed
 python main.py --dump unread        # print messages as text (no GUI)
-python tests/run_all.py             # 186 tests
+python tests/run_all.py             # 215 tests
 ```
 
 ---
@@ -99,7 +99,9 @@ settings_dialog.py    account / sending / sync / appearance, with a connection t
 mail_sync.py          FolderSynchronizer (pure Python) + SyncWorker/SyncController (Qt)
 mail_receiver.py      IMAP: imbox compatibility, folders, search, flags, move, append
 mail_sender.py        SMTP: message building, reply/forward composition, sending
-mail_storage.py       message store: dedup, flags, unread counts, on-disk .eml cache
+mail_storage.py       message store: index + raw cache + parsed-message LRU
+mail_database.py      SQLite index: one row per message, sync bookmarks per folder
+theme.py              light/dark palettes and the application stylesheet
 outbox.py             disk queue for unsent mail, with exponential backoff
 notifications.py      system tray icon, unread badge, new-mail toasts
 mail_parser.py        raw bytes -> models.Email (MIME tree walk)
@@ -110,7 +112,7 @@ models.py             Address, Attachment, Email dataclasses
 config.py             config.ini + environment settings
 logging_setup.py      structured JSON logging with password redaction
 qt_bootstrap.py       fixes PySide6 DLL loading on Windows/conda
-tests/                fake IMAP + fake SMTP servers, 186 tests
+tests/                fake IMAP + fake SMTP servers, 215 tests
 ```
 
 **Threading.** The UI thread performs no network calls. `SyncController` owns one
@@ -130,7 +132,7 @@ per interval, and nothing is rebuilt, so the selection and scroll position survi
 ## 3. Verification report
 
 Everything below was executed on this machine. `python tests/run_all.py` runs the
-whole suite (186 tests, ~55 s).
+whole suite (215 tests, ~55 s).
 
 | # | Feature | What changed / why | How it was verified | Files |
 |---|---|---|---|---|
@@ -148,6 +150,10 @@ whole suite (186 tests, ~55 s).
 | 11 | **Errors** | Timeout, auth, DNS, refused, TLS, disconnect → one message each, with provider hints | `test_receiver` + `test_sender` cover each branch; GUI test shows a wrong password ends as "Sync failed" with an empty list, not a crash | `mail_receiver.py`, `mail_sender.py` |
 | 12 | **Logging** | Console + rotating JSON `logs/mailviewer.log`; a filter scrubs registered secrets and `password=`/`LOGIN` shapes | `test_logging` (7): structured fields survive, registered secrets, `password=` text, `LOGIN` commands and secret-named keys are all masked. Also checked on the real log file written during the Gmail `--check`: 0 occurrences of the stored app password | `logging_setup.py` |
 | 13 | **Configuration** | `config.ini` with `[account] [smtp] [sync] [viewer] [window]`, environment overrides, window geometry remembered | Round-tripped by the GUI tests (each builds settings, saves on close) | `config.py`, `settings_dialog.py` |
+| 19 | **Readable in every theme** | Fusion style + complete palette + stylesheet applied together; muted text uses a real colour instead of an alpha channel | Reproduced first: Windows reported `AppsUseLightTheme = 0` while the app theme was `light`. Screenshots of the light and dark themes taken from the running client; toolbar, folder tree, headers and status bar all legible in both | `theme.py`, `viewer.py` |
+| 20 | **Incremental sync** | SQLite index with per-folder `UIDVALIDITY` / highest UID / `HIGHESTMODSEQ`; new mail by UID range, flag changes by `CHANGEDSINCE`, deletions only when counts disagree | `test_sync`: the second pass asserts the FETCH ranges - a `6:*` style range is present and no unqualified `1:*` scan remains; a server without CONDSTORE still full-scans; a restart downloads nothing and still lists everything. `test_database` (19): bookmarks survive reopening, prune, per-account isolation, closed-index guard | `mail_database.py`, `mail_storage.py`, `mail_sync.py`, `mail_receiver.py`, `models.py` |
+| 21 | **Delete reaches the server** | Verified delete/move returning `(ok, still_there)`; the trash folder is passed explicitly instead of being guessed by the worker; rows are restored when the server kept the message; a sync follows every successful delete | `test_receiver`: a server configured to answer OK without deleting is detected for both delete and move, and `present_uids` reports what is left. `test_gui_integration`: delete-to-trash and permanent delete still assert the server state | `mail_receiver.py`, `mail_sync.py`, `viewer.py` |
+| — | **Flag bug from the index** | Rows restored from the index are independent objects, so worker flag updates never reached the displayed row - "unstar" re-starred. Flags are now written into the row, and clicks apply optimistically | Caught by the GUI suite; `test_star_and_unstar` and `test_mark_read_and_unread` now pass twice in a row | `viewer.py` |
 | 16 | **Multiple accounts** | Profiles in `config.ini`; one store + one sync thread + one IMAP connection per account; account roots in the folder tree; From picker in compose | `test_outbox_config` (20): round trip, migration of an old file, distinct cache keys, per-profile SMTP, env override hits only the active profile. `test_gui_integration`: two accounts sync in parallel against two fake servers, switching swaps the list, starring in "Work" leaves "Personal" untouched | `config.py`, `viewer.py`, `mail_sync.py`, `compose_window.py`, `settings_dialog.py` |
 | 17 | **New-mail notifications** | Tray icon with unread badge, toast per arrival, click opens the message, first sync stays silent | `test_gui_integration`: first sync raises no toast, an arriving message raises exactly one, an already-read arrival raises none, badge tracks the mailbox, icon renders with and without a badge | `notifications.py`, `viewer.py`, `config.py` |
 | 18 | **Outbox + SMTP fallback** | Unsent mail is queued to disk and retried with backoff; ports 587/465/25 are tried in turn; failures are classified retryable or not | `test_outbox_config`: persistence across a restart, backoff growth and cap, per-account filtering, exhaustion. `test_sender`: TLS failure on 587 falls back to 465, auth failure is *not* retryable. `test_gui_integration`: a failed send queues, a later retry delivers it and files it in Sent | `outbox.py`, `mail_sender.py`, `viewer.py`, `compose_window.py` |
@@ -234,6 +240,47 @@ pairs are tried automatically (587/STARTTLS → 465/SSL → 25). If none answer,
 error message includes a probe of all three ports and names the usual causes
 (VPN, ISP, corporate firewall) instead of just reporting a timeout.
 
+### Theme, local index and verified deletes
+
+**One theme, applied as a unit.** Setting only a palette is not enough on
+Windows: the native *windows11* style paints tool buttons and menu text with the
+colours of the **operating system's** light/dark setting. With Windows in dark
+mode and the application forced to light, toolbar labels came out white on
+white. `theme.py` now applies the Fusion style, a complete palette (including
+the Disabled group) and a matching stylesheet together, so a theme is exactly
+what it says regardless of the OS setting. `system` follows the desktop through
+`QStyleHints.colorScheme()`, with the registry as a fallback.
+
+**A modern look.** Flat toolbars with hover states, rounded inputs with an
+accent focus ring, soft rounded row selection, slim scrollbars, styled tabs,
+menus and group boxes - all generated from the same palette, so light and dark
+stay consistent.
+
+**A local index instead of a full rescan.** `mail_database.py` keeps one SQLite
+row per message (sender, subject, date, size, flags, preview) plus, per folder,
+`UIDVALIDITY`, the highest UID seen and `HIGHESTMODSEQ`. A sync then asks only
+for the difference:
+
+| | before | now |
+|---|---|---|
+| new mail | `UID FETCH 1:*` over the whole mailbox | `UID FETCH <highest+1>:*` |
+| flag changes | compared every message | `CHANGEDSINCE <modseq>` (RFC 7162) |
+| deletions | implied by the full scan | UID list requested *only* when the count disagrees |
+| start-up | re-parsed every cached `.eml` | one SQL query; bodies parsed when opened |
+
+A mailbox with 1800 messages therefore costs one small FETCH per interval
+instead of a full listing, and the window fills immediately. Servers without
+CONDSTORE (rare) keep the old single-round-trip full scan.
+
+**Deletes are verified.** `ImapClient.delete()` and `.move()` now re-check the
+source folder afterwards and return `(ok, still_there)`. Several servers answer
+OK to a STORE/EXPUNGE that does not actually remove anything, and the previous
+code trusted that answer - the row vanished from the list while the mail was
+still in the mailbox. Now the row is only dropped for messages the server
+confirms are gone, anything it kept is put back in the list with an explanatory
+message, and a successful delete is followed by a (cheap) sync so the list and
+the mailbox cannot drift apart.
+
 ---
 
 ## 4. Features
@@ -261,8 +308,8 @@ permanent, confirmed), move to any folder, mark read/unread, star/unstar, search
 ## 5. Testing
 
 ```bash
-python tests/run_all.py              # 186 tests, ~55 s
-python tests/run_all.py --no-gui     # 146 tests, ~2 s, no windows
+python tests/run_all.py              # 215 tests, ~55 s
+python tests/run_all.py --no-gui     # 175 tests, ~5 s, no windows
 python tests/test_receiver.py -v     # one suite
 python tests/make_samples.py         # regenerate samples/*.eml
 ```
@@ -283,6 +330,7 @@ The suites never touch a real server:
 | `test_sync.py` | 18 | incremental sync, dedup, cache, UIDVALIDITY, cancellation, failures |
 | `test_logging.py` | 7 | structured JSON fields, password redaction in messages, args and extras |
 | `test_outbox_config.py` | 20 | outbox persistence/backoff/exhaustion, multi-account config round trip and migration |
+| `test_database.py` | 22 | SQLite index, sync bookmarks, summaries, lazy body loading, pruning |
 | `test_gui_integration.py` | 40 | the real window against the fake server: startup, sync, flags, delete, search, sort, compose, folders, auth failure |
 
 ---

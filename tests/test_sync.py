@@ -99,13 +99,56 @@ class SyncTests(unittest.TestCase):
                 synchronizer = FolderSynchronizer(client, store)
                 synchronizer.sync("INBOX")
                 downloads = body_fetches(server)
-                server.mailboxes["INBOX"][0].flags.add("\\Seen")
-                server.mailboxes["INBOX"][1].flags.add("\\Flagged")
+                server.touch_flags("INBOX", 1, add={"\\Seen"})
+                server.touch_flags("INBOX", 2, add={"\\Flagged"})
                 result = synchronizer.sync("INBOX")
         self.assertEqual(len(result.flag_updates), 2)
         self.assertEqual(body_fetches(server), downloads)
         self.assertTrue(store.message("INBOX", 1).is_read)
         self.assertTrue(store.message("INBOX", 2).is_starred)
+
+    def test_second_pass_is_incremental_and_asks_only_for_new_uids(self) -> None:
+        """The point of the local index: the server is not asked about mail we
+        already have."""
+        with fake_imap_server(mailboxes={"INBOX": messages(5)}) as server:
+            with ImapClient(ACCOUNT) as client:
+                store = self.store()
+                synchronizer = FolderSynchronizer(client, store)
+                synchronizer.sync("INBOX")
+
+                before = len(server.commands)
+                server.add_message("INBOX", FakeMessage(
+                    uid=42, raw=sample_message(subject="Brand new")))
+                result = synchronizer.sync("INBOX")
+
+        self.assertTrue(result.incremental)
+        self.assertEqual([m.subject for m in result.new_messages], ["Brand new"])
+
+        # (message set, spec) of every metadata FETCH of the second pass.
+        fetches = [(str(command[2]), str(command[3])) for command in server.commands[before:]
+                   if command[0] == "uid" and command[1] == "FETCH"
+                   and "BODY" not in str(command[3])]
+        self.assertTrue(fetches, "no status fetch was issued")
+        self.assertTrue(any(message_set.startswith("6:") for message_set, _ in fetches),
+                        f"expected a 6:* style range, got {fetches}")
+        # A whole-mailbox range is only acceptable with CHANGEDSINCE, which
+        # makes the server answer with just the messages that changed.
+        unqualified = [message_set for message_set, spec in fetches
+                       if message_set == "1:*" and "CHANGEDSINCE" not in spec.upper()]
+        self.assertEqual(unqualified, [],
+                         "the mailbox must not be scanned in full any more")
+
+    def test_full_scan_when_the_server_has_no_condstore(self) -> None:
+        with fake_imap_server(mailboxes={"INBOX": messages(3)},
+                              capabilities=("IMAP4REV1", "MOVE")) as server:
+            with ImapClient(ACCOUNT) as client:
+                store = self.store()
+                synchronizer = FolderSynchronizer(client, store)
+                synchronizer.sync("INBOX")
+                server.touch_flags("INBOX", 1, add={"\\Seen"})
+                result = synchronizer.sync("INBOX")
+        self.assertFalse(result.incremental)
+        self.assertEqual(len(result.flag_updates), 1)
 
     def test_removed_message_is_dropped(self) -> None:
         with fake_imap_server(mailboxes={"INBOX": messages(3)}) as server:
@@ -161,21 +204,46 @@ class SyncTests(unittest.TestCase):
         self.assertEqual(len(result.new_messages), 2)
 
     # ---------------------------------------------------------------- caching
-    def test_cache_avoids_a_second_download_after_restart(self) -> None:
+    def test_restart_downloads_nothing_and_still_shows_everything(self) -> None:
+        """After a restart the index already knows the mailbox.
+
+        Before the index existed this re-parsed every cached ``.eml``; now the
+        second run recognises the UIDs and asks the server for nothing at all.
+        """
         with fake_imap_server(mailboxes={"INBOX": messages(3)}) as server:
             with ImapClient(ACCOUNT) as client:
                 first_store = self.store(cache=True)
                 FolderSynchronizer(client, first_store).sync("INBOX")
+                first_store.close()
                 downloads = body_fetches(server)
 
-                # "Restart": a brand new store, same cache directory.
+                # "Restart": a brand new store over the same cache directory.
                 second_store = self.store(cache=True)
                 result = FolderSynchronizer(client, second_store).sync("INBOX")
 
-        self.assertEqual(len(result.new_messages), 3)
-        self.assertEqual(result.from_cache, 3)
+        self.assertEqual(len(result.new_messages), 0, "nothing is new after a restart")
+        self.assertEqual(len(second_store.messages("INBOX")), 3,
+                         "the list is restored from the index")
         self.assertEqual(body_fetches(server), downloads,
-                         "cached messages must not be downloaded again")
+                         "known messages must not be downloaded again")
+
+    def test_a_body_is_parsed_only_when_the_message_is_opened(self) -> None:
+        with fake_imap_server(mailboxes={"INBOX": messages(2)}):
+            with ImapClient(ACCOUNT) as client:
+                store = self.store(cache=True)
+                FolderSynchronizer(client, store).sync("INBOX")
+                store.close()
+
+        restored = self.store(cache=True)
+        summary = restored.messages("INBOX")[0]
+        self.assertFalse(summary.loaded)
+        self.assertTrue(summary.subject)          # headers come from the index
+        self.assertTrue(summary.preview())        # so does the snippet
+        self.assertEqual(summary.text_body, "")   # but no MIME was parsed
+
+        full = restored.ensure_loaded(summary)
+        self.assertTrue(full.loaded)
+        self.assertIn("body", full.text_body)
 
     def test_load_from_cache_without_network(self) -> None:
         with fake_imap_server(mailboxes={"INBOX": messages(2)}):

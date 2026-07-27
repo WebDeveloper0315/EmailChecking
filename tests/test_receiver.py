@@ -221,11 +221,47 @@ class FlagTests(unittest.TestCase):
         self.assertIn("\\Seen", server.mailboxes["INBOX"][0].flags)
 
 
+class DeleteVerificationTests(unittest.TestCase):
+    """A server that answers OK without deleting must not fool the client."""
+
+    def test_delete_reports_messages_the_server_kept(self) -> None:
+        with fake_imap_server(mailboxes={"INBOX": inbox(3), "Trash": []},
+                              ignore_deletes=True) as server:
+            with ImapClient(ACCOUNT) as client:
+                ok, remaining = client.delete("INBOX", [1, 2], permanent=True)
+        self.assertFalse(ok, "the delete silently failed and must be reported")
+        self.assertEqual(remaining, [1, 2])
+        self.assertEqual(len(server.mailboxes["INBOX"]), 3)
+
+    def test_move_reports_messages_the_server_kept(self) -> None:
+        with fake_imap_server(mailboxes={"INBOX": inbox(2), "Trash": []},
+                              ignore_deletes=True) as server:
+            with ImapClient(ACCOUNT) as client:
+                ok, remaining = client.move("INBOX", [1], "Trash")
+        self.assertFalse(ok)
+        self.assertEqual(remaining, [1])
+        self.assertEqual(len(server.mailboxes["INBOX"]), 2)
+
+    def test_successful_delete_reports_nothing_remaining(self) -> None:
+        with fake_imap_server(mailboxes={"INBOX": inbox(3), "Trash": []}):
+            with ImapClient(ACCOUNT) as client:
+                ok, remaining = client.delete("INBOX", [2], permanent=True)
+        self.assertTrue(ok)
+        self.assertEqual(remaining, [])
+
+    def test_present_uids_answers_what_the_server_still_has(self) -> None:
+        with fake_imap_server(mailboxes={"INBOX": inbox(3)}):
+            with ImapClient(ACCOUNT) as client:
+                self.assertEqual(client.present_uids("INBOX", [1, 2, 99]), {1, 2})
+
+
 class DeleteAndMoveTests(unittest.TestCase):
     def test_move_uses_the_move_extension(self) -> None:
         with fake_imap_server(mailboxes={"INBOX": inbox(2), "Trash": []}) as server:
             with ImapClient(ACCOUNT) as client:
-                self.assertTrue(client.move("INBOX", [1], "Trash"))
+                ok, remaining = client.move("INBOX", [1], "Trash")
+                self.assertTrue(ok)
+                self.assertEqual(remaining, [])
         self.assertEqual(len(server.mailboxes["Trash"]), 1)
         self.assertEqual([m.uid for m in server.mailboxes["INBOX"]], [2])
         self.assertTrue(any(c[1] == "MOVE" for c in server.commands if c[0] == "uid"))
@@ -234,7 +270,8 @@ class DeleteAndMoveTests(unittest.TestCase):
         with fake_imap_server(mailboxes={"INBOX": inbox(2), "Trash": []},
                               capabilities=("IMAP4REV1",)) as server:
             with ImapClient(ACCOUNT) as client:
-                self.assertTrue(client.move("INBOX", [1], "Trash"))
+                ok, _ = client.move("INBOX", [1], "Trash")
+                self.assertTrue(ok)
         self.assertEqual(len(server.mailboxes["Trash"]), 1)
         self.assertEqual([m.uid for m in server.mailboxes["INBOX"]], [2])
         commands = [c[1] for c in server.commands if c[0] == "uid"]

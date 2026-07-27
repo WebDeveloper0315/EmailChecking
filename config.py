@@ -171,10 +171,28 @@ class AccountProfile:
 
     @property
     def key(self) -> str:
-        """Stable identifier used for cache directories and signal routing."""
+        """Identifier of the *mailbox*, used for cache and index directories.
+
+        Deliberately built from the address and server rather than the profile
+        name: renaming an account must not orphan its cache and force every
+        message to be downloaded again.
+        """
         safe = "".join(c if c.isalnum() or c in "-_.@" else "_"
-                       for c in f"{self.name}-{self.account.username}")
+                       for c in f"{self.account.username}@{self.account.host}")
         return safe or "default"
+
+    @property
+    def legacy_keys(self) -> tuple[str, ...]:
+        """Directory names earlier versions used, so their cache can be adopted."""
+        def clean(value: str) -> str:
+            return "".join(c if c.isalnum() or c in "-_.@" else "_" for c in value)
+
+        return tuple(dict.fromkeys(
+            candidate for candidate in (
+                clean(f"{self.name}-{self.account.username}"),
+                clean(self.account.username),
+            ) if candidate and candidate != self.key
+        ))
 
     @property
     def display(self) -> str:

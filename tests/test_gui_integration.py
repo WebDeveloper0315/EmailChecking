@@ -195,7 +195,9 @@ class SyncTests(GuiTestCase):
                          "the open message must stay open while new mail arrives")
 
     def test_flag_change_on_the_server_is_picked_up(self) -> None:
-        self.server.mailboxes["INBOX"][0].flags.add("\\Seen")
+        # touch_flags bumps HIGHESTMODSEQ, exactly as a real server does, so
+        # the incremental pass can notice the change.
+        self.server.touch_flags("INBOX", 1, add={"\\Seen"})
         self.window.sync_now()
         pump(lambda: self.window.store().message("INBOX", 1) is not None
              and self.window.store().message("INBOX", 1).is_read)
