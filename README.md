@@ -12,7 +12,7 @@ python main.py                      # the client
 python main.py --check              # verify IMAP + SMTP configuration, then exit
 python main.py --eml-dir samples    # open local .eml files, no account needed
 python main.py --dump unread        # print messages as text (no GUI)
-python tests/run_all.py             # 215 tests
+python tests/run_all.py             # 235 tests
 ```
 
 ---
@@ -112,7 +112,7 @@ models.py             Address, Attachment, Email dataclasses
 config.py             config.ini + environment settings
 logging_setup.py      structured JSON logging with password redaction
 qt_bootstrap.py       fixes PySide6 DLL loading on Windows/conda
-tests/                fake IMAP + fake SMTP servers, 215 tests
+tests/                fake IMAP + fake SMTP servers, 235 tests
 ```
 
 **Threading.** The UI thread performs no network calls. `SyncController` owns one
@@ -132,7 +132,7 @@ per interval, and nothing is rebuilt, so the selection and scroll position survi
 ## 3. Verification report
 
 Everything below was executed on this machine. `python tests/run_all.py` runs the
-whole suite (215 tests, ~55 s).
+whole suite (235 tests, ~55 s).
 
 | # | Feature | What changed / why | How it was verified | Files |
 |---|---|---|---|---|
@@ -153,6 +153,8 @@ whole suite (215 tests, ~55 s).
 | 19 | **Readable in every theme** | Fusion style + complete palette + stylesheet applied together; muted text uses a real colour instead of an alpha channel | Reproduced first: Windows reported `AppsUseLightTheme = 0` while the app theme was `light`. Screenshots of the light and dark themes taken from the running client; toolbar, folder tree, headers and status bar all legible in both | `theme.py`, `viewer.py` |
 | 20 | **Incremental sync** | SQLite index with per-folder `UIDVALIDITY` / highest UID / `HIGHESTMODSEQ`; new mail by UID range, flag changes by `CHANGEDSINCE`, deletions only when counts disagree | `test_sync`: the second pass asserts the FETCH ranges - a `6:*` style range is present and no unqualified `1:*` scan remains; a server without CONDSTORE still full-scans; a restart downloads nothing and still lists everything. `test_database` (19): bookmarks survive reopening, prune, per-account isolation, closed-index guard | `mail_database.py`, `mail_storage.py`, `mail_sync.py`, `mail_receiver.py`, `models.py` |
 | 21 | **Delete reaches the server** | Verified delete/move returning `(ok, still_there)`; the trash folder is passed explicitly instead of being guessed by the worker; rows are restored when the server kept the message; a sync follows every successful delete | `test_receiver`: a server configured to answer OK without deleting is detected for both delete and move, and `present_uids` reports what is left. `test_gui_integration`: delete-to-trash and permanent delete still assert the server state | `mail_receiver.py`, `mail_sync.py`, `viewer.py` |
+| 22 | **Clickable links** | Clicks go to the desktop browser and never navigate the pane; hover shows the target; context menu copies it; plain-text and bare in-HTML URLs (including schemeless ones) are linkified | `test_parser`: schemeless/`www`/bare-domain linkification, no false positives on "version 1.2.3", trailing punctuation kept outside the link, no nested anchors, `target`/`rel` set. `test_gui_integration`: `acceptNavigationRequest` returns False *and* hands the URL over, `javascript:`/`file:`/`data:` are refused, hover shows the target | `html_processor.py`, `viewer.py` |
+| 23 | **Blank Japanese messages** | `<meta>` and other void tags no longer start "skip until the closing tag", so the body after them survives; `form`/`noscript` are unwrapped; the viewer falls back to the text part when HTML yields nothing | Reproduced against the real message over IMAP (read-only): 0 → 1408 characters of visible text, and it now renders in both backends (QtWebEngine reports 1339 rendered characters including the heading). `test_parser`: `<meta>`/`<link>`/`<base>`/`<input>` regression tests. `test_gui_integration`: a message with `<meta>` after `<head>` renders, and an unrenderable HTML part falls back to plain text | `html_processor.py`, `viewer.py` |
 | — | **Flag bug from the index** | Rows restored from the index are independent objects, so worker flag updates never reached the displayed row - "unstar" re-starred. Flags are now written into the row, and clicks apply optimistically | Caught by the GUI suite; `test_star_and_unstar` and `test_mark_read_and_unread` now pass twice in a row | `viewer.py` |
 | 16 | **Multiple accounts** | Profiles in `config.ini`; one store + one sync thread + one IMAP connection per account; account roots in the folder tree; From picker in compose | `test_outbox_config` (20): round trip, migration of an old file, distinct cache keys, per-profile SMTP, env override hits only the active profile. `test_gui_integration`: two accounts sync in parallel against two fake servers, switching swaps the list, starring in "Work" leaves "Personal" untouched | `config.py`, `viewer.py`, `mail_sync.py`, `compose_window.py`, `settings_dialog.py` |
 | 17 | **New-mail notifications** | Tray icon with unread badge, toast per arrival, click opens the message, first sync stays silent | `test_gui_integration`: first sync raises no toast, an arriving message raises exactly one, an already-read arrival raises none, badge tracks the mailbox, icon renders with and without a badge | `notifications.py`, `viewer.py`, `config.py` |
@@ -281,6 +283,45 @@ confirms are gone, anything it kept is put back in the list with an explanatory
 message, and a successful delete is followed by a (cheap) sync so the list and
 the mailbox cannot drift apart.
 
+### Links and the blank-message bug
+
+**Clickable URLs.** Links in a message open in the desktop browser - the viewer
+itself never navigates. Hovering shows the real target in the status bar (so a
+link cannot pretend to lead somewhere else), the context menu offers *Open* and
+*Copy link address*, and only `http`, `https`, `mailto`, `tel` and `ftp` are
+ever handed to the system: `javascript:`, `file:` and `data:` are refused.
+
+URLs written as plain text are turned into links too, including the schemeless
+form Japanese newsletters like - `crowdworks.jp/public/jobs/search?order=new`
+becomes a link to `https://crowdworks.jp/...`. A curated TLD list keeps
+"version 1.2.3" and "e.g." from becoming links, and bare URLs inside HTML
+bodies are linkified as well, but never inside an existing `<a>`.
+
+**Why some messages were blank.** `<meta>` was on the "drop this tag and
+everything inside it" list, together with `<script>` and `<style>`. But
+`<meta>` is a *void* element: there is no `</meta>`, so the sanitiser started
+skipping at the first one and never stopped - every character after it was
+discarded. Mail HTML routinely repeats `<meta http-equiv="Content-Type">`
+*after* `<head>`, which is exactly what the reported Japanese newsletter does,
+so the whole body vanished while the list preview (built from the text part)
+still showed the content.
+
+Measured on the real message: the sanitiser produced **0** characters of text
+before the fix and **1408** after it; `html_to_text` recovered 48 characters
+before and 1350 after. `link`, `base`, `input`, `embed`, `source`, `track` and
+`param` had the same defect.
+
+Two further hardening steps came out of it:
+
+* `<form>`, `<noscript>`, `<button>` and friends are now *unwrapped* rather than
+  dropped with their contents - they regularly wrap visible wording in
+  marketing mail, while the actual controls (`input`, `select`, `textarea`) are
+  still removed;
+* if an HTML part still renders without any text - an unterminated `<style>`
+  swallows the rest of the document, exactly as it does in a browser - the
+  viewer falls back to the message's plain-text alternative instead of showing
+  an empty panel.
+
 ---
 
 ## 4. Features
@@ -308,8 +349,8 @@ permanent, confirmed), move to any folder, mark read/unread, star/unstar, search
 ## 5. Testing
 
 ```bash
-python tests/run_all.py              # 215 tests, ~55 s
-python tests/run_all.py --no-gui     # 175 tests, ~5 s, no windows
+python tests/run_all.py              # 235 tests, ~55 s
+python tests/run_all.py --no-gui     # 189 tests, ~5 s, no windows
 python tests/test_receiver.py -v     # one suite
 python tests/make_samples.py         # regenerate samples/*.eml
 ```
@@ -324,14 +365,14 @@ The suites never touch a real server:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `test_parser.py` | 39 | MIME structure, charsets, RFC 2047, attachments, malformed input, HTML sanitising |
+| `test_parser.py` | 53 | MIME structure, charsets, RFC 2047, attachments, malformed input, HTML sanitising |
 | `test_receiver.py` | 29 | imbox compatibility, search, byte-exact fetch, flags, move/delete, APPEND, folders, UTF-7, error translation |
 | `test_sender.py` | 33 | message building, reply/reply-all/forward, SMTP conversation and failures |
 | `test_sync.py` | 18 | incremental sync, dedup, cache, UIDVALIDITY, cancellation, failures |
 | `test_logging.py` | 7 | structured JSON fields, password redaction in messages, args and extras |
 | `test_outbox_config.py` | 20 | outbox persistence/backoff/exhaustion, multi-account config round trip and migration |
 | `test_database.py` | 22 | SQLite index, sync bookmarks, summaries, lazy body loading, pruning |
-| `test_gui_integration.py` | 40 | the real window against the fake server: startup, sync, flags, delete, search, sort, compose, folders, auth failure |
+| `test_gui_integration.py` | 47 | the real window against the fake server: startup, sync, flags, delete, search, sort, compose, folders, auth failure |
 
 ---
 

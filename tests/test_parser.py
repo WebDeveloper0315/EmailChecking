@@ -267,6 +267,75 @@ class RobustnessTests(unittest.TestCase):
 
 
 class HtmlProcessingTests(unittest.TestCase):
+    def test_void_meta_does_not_swallow_the_message(self) -> None:
+        """Regression: <meta> has no closing tag.
+
+        Treating it like <script> (drop everything until </meta>) discarded the
+        rest of the body - real Japanese newsletters put <meta> after <head>,
+        and the whole message rendered blank.
+        """
+        result = sanitize_html(
+            "<html><head><title>t</title></head><body>"
+            '<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">'
+            "<p>本日のおススメ案件</p>"
+            '<link rel="stylesheet" href="https://example.com/mail.css">'
+            "<p>after the link</p></body></html>"
+        )
+        self.assertIn("本日のおススメ案件", result.html)
+        self.assertIn("after the link", result.html)
+        self.assertNotIn("stylesheet", result.html)
+
+    def test_html_to_text_survives_void_drop_tags(self) -> None:
+        text = html_to_text('<meta charset="utf-8"><p>visible</p>'
+                            '<link rel="x"><p>also visible</p>')
+        self.assertIn("visible", text)
+        self.assertIn("also visible", text)
+
+    def test_other_void_drop_tags_behave(self) -> None:
+        for tag in ('<base href="https://x.example/">', '<input type="text">',
+                    '<source src="a.mp4">', '<embed src="a.swf">'):
+            result = sanitize_html(f"<div>before{tag}after</div>")
+            self.assertIn("before", result.html, tag)
+            self.assertIn("after", result.html, tag)
+
+    def test_text_hidden_by_an_unknown_wrapper_is_recovered(self) -> None:
+        """The safety net: markup that yields no text falls back to the text."""
+        result = sanitize_html("<form><p>only inside a dropped element</p></form>")
+        self.assertIn("only inside a dropped element", html_to_text(result.html))
+
+    def test_text_inside_forms_and_noscript_is_kept(self) -> None:
+        """These wrap visible wording in marketing mail; only the controls go."""
+        result = sanitize_html(
+            "<form action='https://x.example'><p>Unsubscribe from this list</p>"
+            "<input type='email' value='secret@example.com'>"
+            "<button>Send</button></form>"
+            "<noscript><p>Enable images to see this</p></noscript>"
+        )
+        self.assertIn("Unsubscribe from this list", result.html)
+        self.assertIn("Send", result.html)
+        self.assertIn("Enable images to see this", result.html)
+        self.assertNotIn("<input", result.html)
+        self.assertNotIn("secret@example.com", result.html)
+        self.assertNotIn("<form", result.html)
+
+    def test_select_and_textarea_are_still_dropped_entirely(self) -> None:
+        result = sanitize_html("<select><option>hidden choice</option></select>"
+                               "<textarea>hidden text</textarea><p>kept</p>")
+        self.assertNotIn("hidden choice", result.html)
+        self.assertNotIn("hidden text", result.html)
+        self.assertIn("kept", result.html)
+
+    def test_unclosed_style_swallows_the_rest_like_a_browser(self) -> None:
+        """Documented behaviour, not an accident.
+
+        HTML says everything after an unterminated <style> is CSS, and browsers
+        agree, so the sanitiser cannot invent text here.  The viewer covers this
+        by showing the message's plain-text part instead (see the GUI tests).
+        """
+        result = sanitize_html("<div><style>p{color:red}<p>swallowed</div>")
+        self.assertNotIn("color:red", result.html)
+        self.assertEqual(html_to_text(result.html).strip(), "")
+
     def test_script_and_style_are_removed_with_content(self) -> None:
         result = sanitize_html(
             "<p>ok</p><script>alert('x')</script><style>p{color:red}</style>"
@@ -349,6 +418,40 @@ class HtmlProcessingTests(unittest.TestCase):
         html = text_to_html("see https://example.com now\n> quoted line")
         self.assertIn('href="https://example.com"', html)
         self.assertIn("quote", html)
+
+    def test_urls_without_a_scheme_become_links(self) -> None:
+        html = text_to_html("jobs at crowdworks.jp/public/jobs/search?order=new today")
+        self.assertIn('href="https://crowdworks.jp/public/jobs/search?order=new"', html)
+        self.assertIn(">crowdworks.jp/public/jobs/search?order=new</a>", html)
+
+    def test_www_and_bare_domains(self) -> None:
+        html = text_to_html("visit www.example.com or example.co.uk/page")
+        self.assertIn('href="https://www.example.com"', html)
+        self.assertIn('href="https://example.co.uk/page"', html)
+
+    def test_ordinary_text_is_not_turned_into_links(self) -> None:
+        html = text_to_html("version 1.2.3 released, e.g. today. Mr. Smith agreed.")
+        self.assertNotIn("<a href", html)
+
+    def test_trailing_punctuation_stays_outside_the_link(self) -> None:
+        html = text_to_html("see https://example.com/page, then stop.")
+        self.assertIn('href="https://example.com/page"', html)
+        self.assertIn("</a>,", html)
+
+    def test_bare_urls_in_html_bodies_become_clickable(self) -> None:
+        result = sanitize_html("<p>Apply at crowdworks.jp/public/jobs now</p>")
+        self.assertIn('href="https://crowdworks.jp/public/jobs"', result.html)
+
+    def test_links_are_not_nested_inside_existing_anchors(self) -> None:
+        result = sanitize_html('<a href="https://tracker.example/r?u=1">example.com/page</a>',
+                               allow_remote_images=True)
+        self.assertEqual(result.html.count("<a "), 1)
+        self.assertIn("https://tracker.example/r?u=1", result.html)
+
+    def test_links_carry_target_and_noopener(self) -> None:
+        result = sanitize_html('<a href="https://example.com">click</a>')
+        self.assertIn('target="_blank"', result.html)
+        self.assertIn('rel="noopener noreferrer"', result.html)
 
     def test_html_to_text_keeps_structure(self) -> None:
         text = html_to_text("<p>one</p><ul><li>a</li><li>b</li></ul>")

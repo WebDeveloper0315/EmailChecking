@@ -48,18 +48,32 @@ ALLOWED_TAGS: frozenset[str] = frozenset(
     """.split()
 )
 
-#: Dropped together with everything inside them.
+#: Dropped together with everything inside them: markup that either executes,
+#: loads something, or holds no readable text.
 DROP_WITH_CONTENT: frozenset[str] = frozenset(
     """
     script style head title meta link base iframe frame frameset noframes object
-    embed applet param form input select option optgroup textarea button svg
-    math canvas audio video source track template noscript xml
+    embed applet param input select textarea svg math canvas audio video source
+    track template xml
     """.split()
+)
+
+#: Not in ALLOWED_TAGS, so the tag disappears - but the text inside it stays.
+#: ``form``, ``noscript`` and ``button`` regularly wrap *visible* wording in
+#: marketing mail; dropping their contents made such messages look empty.
+UNWRAPPED: frozenset[str] = frozenset(
+    "form noscript button option optgroup fieldset legend".split()
 )
 
 VOID_TAGS: frozenset[str] = frozenset(
     "area base br col embed hr img input link meta param source track wbr".split()
 )
+
+#: Dropped tags that are *void*: they never have a closing tag, so they must be
+#: skipped on their own.  Treating them like ``<script>`` (drop everything until
+#: the matching end tag) swallows the rest of the message - a real bug, because
+#: mail HTML routinely carries ``<meta>`` and ``<link>`` outside ``<head>``.
+DROP_VOID: frozenset[str] = DROP_WITH_CONTENT & VOID_TAGS
 
 #: Attributes accepted on every tag.
 GLOBAL_ATTRS: frozenset[str] = frozenset({"style", "title", "dir", "lang", "align"})
@@ -95,9 +109,25 @@ _CSS_BLOCKLIST = re.compile(
 )
 _CSS_URL = re.compile(r"url\s*\(\s*['\"]?([^)'\"]*)['\"]?\s*\)", re.IGNORECASE)
 
-_URL_IN_TEXT = re.compile(r"(?<![\w@.])((?:https?://|www\.)[^\s<>\"')\]]+)", re.IGNORECASE)
+#: Top level domains recognised in text that has no scheme, e.g.
+#: "crowdworks.jp/public/jobs".  A list keeps "version 1.2.3" and "e.g." from
+#: turning into links, which a generic "word.word" pattern would do.
+_LINKABLE_TLDS = (
+    "com|net|org|edu|gov|mil|int|info|biz|name|pro|app|dev|io|ai|me|co|tv|cc|"
+    "shop|site|online|xyz|blog|cloud|tech|store|news|email|jp|kr|cn|tw|hk|sg|"
+    "uk|de|fr|it|es|nl|se|no|fi|dk|pl|ru|ua|br|mx|ca|au|nz|in|id|th|vn|ph|ch|at"
+)
+_URL_IN_TEXT = re.compile(
+    r"(?<![\w@.\-/])("
+    r"(?:https?://|www\.)[^\s<>\"')\]]+"                     # explicit
+    r"|(?:[a-z0-9](?:[a-z0-9\-]*[a-z0-9])?\.)+"              # host labels
+    rf"(?:{_LINKABLE_TLDS})"                                 # known TLD
+    r"(?::\d{2,5})?(?:/[^\s<>\"')\]]*)?"                     # port and path
+    r")",
+    re.IGNORECASE,
+)
 _EMAIL_IN_TEXT = re.compile(r"(?<![\w.])([\w.+-]+@[\w-]+\.[\w.-]+)(?![\w.])")
-_TRAILING_PUNCT = ".,;:!?"
+_TRAILING_PUNCT = ".,;:!?、。）」"
 
 #: `src` fragments that are tracking beacons even at a visible size.
 _TRACKER_HINTS = ("/open?", "open.aspx", "/track", "tracking", "/pixel", "beacon",
@@ -141,6 +171,8 @@ class _Sanitizer(HTMLParser):
             if tag == self._skip_tag:
                 self._skip_level += 1
             return
+        if tag in DROP_VOID:
+            return                      # drop the tag, keep what follows
         if tag in DROP_WITH_CONTENT:
             self._skip_tag, self._skip_level = tag, 1
             return
@@ -182,7 +214,12 @@ class _Sanitizer(HTMLParser):
     def handle_data(self, data: str) -> None:
         if self._skip_tag is not None or not data:
             return
-        self._out.append(html.escape(data, quote=False))
+        escaped = html.escape(data, quote=False)
+        # Bare URLs written as text become clickable too - but never inside an
+        # existing <a>, which would nest anchors.
+        if "a" not in self._open:
+            escaped = _linkify(escaped)
+        self._out.append(escaped)
 
     def handle_entityref(self, name: str) -> None:  # convert_charrefs misses some
         if self._skip_tag is None:
@@ -202,6 +239,11 @@ class _Sanitizer(HTMLParser):
         logger.debug("HTML parse error: %s", message)
 
     # ----------------------------------------------------------------- output
+    @property
+    def unterminated(self) -> Optional[str]:
+        """The tag we were still skipping when the input ended, if any."""
+        return self._skip_tag
+
     def close_document(self) -> str:
         while self._open:
             self._out.append(f"</{self._open.pop()}>")
@@ -344,6 +386,21 @@ def sanitize_html(
         return SanitizedHtml(html=text_to_html(html_to_text(raw_html)))
     result = parser.result
     result.html = parser.close_document()
+
+    if parser.unterminated:
+        logger.warning("HTML ended inside <%s>; the rest of the message was skipped",
+                       parser.unterminated)
+
+    # Safety net: if sanitising produced markup with no readable text at all
+    # while the source clearly had some, show the text rather than a blank
+    # panel.  An unclosed <style> or a malformed construct must never make a
+    # message look empty.
+    if not html_to_text(result.html).strip():
+        fallback = html_to_text(raw_html).strip()
+        if fallback:
+            logger.warning("Sanitised HTML lost every text node; showing plain text "
+                           "instead (%d characters recovered)", len(fallback))
+            result.html = text_to_html(fallback)
     return result
 
 
@@ -375,7 +432,11 @@ def _linkify(escaped_text: str) -> str:
         trailing = ""
         while url and url[-1] in _TRAILING_PUNCT:
             trailing, url = url[-1] + trailing, url[:-1]
-        href = url if url.lower().startswith(("http://", "https://")) else "http://" + url
+        if not url:
+            return match.group(0)
+        # A URL written without a scheme gets https, not http: plain http would
+        # be downgraded or refused by most of the sites people link to today.
+        href = url if url.lower().startswith(("http://", "https://")) else "https://" + url
         return (f'<a href="{html.escape(href, quote=True)}" target="_blank" '
                 f'rel="noopener noreferrer">{url}</a>{trailing}')
 
@@ -399,6 +460,8 @@ class _TextExtractor(HTMLParser):
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, Optional[str]]]) -> None:
         tag = tag.lower()
+        if tag in DROP_VOID:
+            return                      # no closing tag: never start skipping
         if tag in DROP_WITH_CONTENT:
             self._skip += 1
         elif tag == "li":
@@ -412,6 +475,8 @@ class _TextExtractor(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
+        if tag in DROP_VOID:
+            return
         if tag in DROP_WITH_CONTENT:
             self._skip = max(0, self._skip - 1)
         elif tag in self._BLOCK:

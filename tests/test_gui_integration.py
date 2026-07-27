@@ -517,6 +517,132 @@ class NotificationTests(GuiTestCase):
         self.assertFalse(make_mail_icon(150).isNull())
 
 
+class LinkAndRenderingTests(GuiTestCase):
+    """Clicking a URL must reach the desktop browser, and no message may look
+    empty while it has content."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.opened: list[str] = []
+        import viewer as viewer_module
+
+        original = viewer_module.QDesktopServices.openUrl
+        viewer_module.QDesktopServices.openUrl = lambda url: self.opened.append(
+            url.toString() if hasattr(url, "toString") else str(url))
+        self.addCleanup(
+            lambda: setattr(viewer_module.QDesktopServices, "openUrl", original))
+
+    def test_clicking_a_link_opens_the_browser(self) -> None:
+        from PySide6.QtCore import QUrl
+
+        viewer._open_external(QUrl("https://example.com/offer?id=1"))
+        self.assertEqual(self.opened, ["https://example.com/offer?id=1"])
+
+    def test_open_link_reports_through_the_body_view(self) -> None:
+        reported: list[str] = []
+        self.window._body.link_opened.connect(reported.append)
+        self.window._body.open_link("https://example.com/page")
+        # Checked before pumping: a background sync would otherwise replace the
+        # status message while the event loop runs.
+        self.assertIn("example.com", self.window.statusBar().currentMessage())
+        self.assertEqual(self.opened, ["https://example.com/page"])
+        self.assertEqual(reported, ["https://example.com/page"])
+
+    def test_dangerous_schemes_are_never_handed_to_the_desktop(self) -> None:
+        from PySide6.QtCore import QUrl
+
+        for url in ("javascript:alert(1)", "file:///C:/Windows/System32/cmd.exe",
+                    "data:text/html,<script>x</script>"):
+            viewer._open_external(QUrl(url))
+        self.assertEqual(self.opened, [])
+
+    def test_the_viewer_never_navigates_to_a_clicked_link_itself(self) -> None:
+        """A click must hand the URL to the browser and stay put."""
+        if not viewer.WEBENGINE_AVAILABLE or self.window._body._web is None:
+            self.skipTest("QtWebEngine backend not in use")
+        from PySide6.QtCore import QUrl
+        from PySide6.QtWebEngineCore import QWebEnginePage
+
+        page = self.window._body._web.page()
+        accepted = page.acceptNavigationRequest(
+            QUrl("https://example.com/clicked"),
+            QWebEnginePage.NavigationType.NavigationTypeLinkClicked,
+            True,
+        )
+        self.assertFalse(accepted, "the message pane must not follow the link")
+        self.assertEqual(self.opened, ["https://example.com/clicked"])
+
+    def test_hovering_a_link_shows_the_target(self) -> None:
+        self.window._body._on_link_hovered("https://example.com/where-it-goes")
+        self.assertIn("https://example.com/where-it-goes",
+                      self.window.statusBar().currentMessage())
+        self.window._body._on_link_hovered("")
+        self.assertEqual(self.window.statusBar().currentMessage(), "")
+
+    def test_message_with_meta_outside_head_is_not_blank(self) -> None:
+        """The reported Japanese newsletter: <meta> after <head> swallowed
+        everything that followed."""
+        raw = (
+            b"From: news@example.jp\r\nTo: me@example.com\r\n"
+            b"Subject: =?UTF-8?B?44GK44GZ44K544Oh?=\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/alternative; boundary="B"\r\n\r\n'
+            b"--B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+            + "本日のおススメ案件".encode() + b"\r\n"
+            b"--B\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+            b"<html><head></head><body>"
+            b'<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">'
+            b"<table><tr><td>" + "本日のおススメ案件".encode() +
+            b'</td></tr></table><p>crowdworks.jp/public/jobs</p>'
+            b"</body></html>\r\n--B--\r\n"
+        )
+        self.server.add_message("INBOX", FakeMessage(uid=321, raw=raw))
+        self.window.sync_now()
+        pump(lambda: self.window._model.row_for_uid("321") >= 0, timeout=10)
+
+        row = self.window._model.row_for_uid("321")
+        index = self.window._proxy.mapFromSource(self.window._model.index(row, 0))
+        self.window._list_view.setCurrentIndex(index)
+        pump(lambda: self.window._current is not None
+             and self.window._current.uid == "321", timeout=5)
+
+        mail = self.window._current
+        from html_processor import html_to_text, sanitize_html
+
+        rendered = sanitize_html(mail.html_body, allow_remote_images=False)
+        text = html_to_text(rendered.html)
+        self.assertIn("本日のおススメ案件", text,
+                      "the body must survive a <meta> outside <head>")
+        # ...and the bare URL in it is clickable.
+        self.assertIn('href="https://crowdworks.jp/public/jobs"', rendered.html)
+
+    def test_html_part_without_text_falls_back_to_the_plain_part(self) -> None:
+        raw = (
+            b"From: news@example.jp\r\nTo: me@example.com\r\nSubject: Fallback\r\n"
+            b"MIME-Version: 1.0\r\n"
+            b'Content-Type: multipart/alternative; boundary="B"\r\n\r\n'
+            b"--B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n"
+            b"the readable text part\r\n"
+            b"--B\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+            b"<div><style>p{color:red}<p>swallowed by the unclosed style</div>\r\n"
+            b"--B--\r\n"
+        )
+        self.server.add_message("INBOX", FakeMessage(uid=322, raw=raw))
+        self.window.sync_now()
+        pump(lambda: self.window._model.row_for_uid("322") >= 0, timeout=10)
+
+        row = self.window._model.row_for_uid("322")
+        index = self.window._proxy.mapFromSource(self.window._model.index(row, 0))
+        self.window._list_view.setCurrentIndex(index)
+        pump(lambda: self.window._current is not None
+             and self.window._current.uid == "322", timeout=5)
+
+        result = self.window._body.show_email(self.window._current, False)
+        from html_processor import html_to_text
+
+        self.assertIn("the readable text part", html_to_text(result.html))
+
+
 class MultiAccountTests(unittest.TestCase):
     """Two accounts, synchronised at the same time."""
 

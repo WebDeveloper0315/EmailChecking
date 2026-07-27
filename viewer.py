@@ -100,7 +100,13 @@ from attachment_manager import (  # noqa: E402
     save_attachment,
 )
 from config import AppSettings  # noqa: E402
-from html_processor import SanitizedHtml, build_document, sanitize_html, text_to_html  # noqa: E402
+from html_processor import (  # noqa: E402
+    SanitizedHtml,
+    build_document,
+    html_to_text,
+    sanitize_html,
+    text_to_html,
+)
 from logging_setup import get_logger  # noqa: E402
 from mail_parser import find_inline_attachment, parse_email  # noqa: E402
 from mail_receiver import FILTERS, EmlFileSource, FolderInfo  # noqa: E402
@@ -490,7 +496,17 @@ if WEBENGINE_AVAILABLE:
 
 
 class BodyView(QWidget):
-    """Renders a message body with whichever engine is available."""
+    """Renders a message body with whichever engine is available.
+
+    Links are never followed inside the viewer: a click hands the URL to the
+    desktop browser, hovering shows the target (so a link cannot pretend to go
+    somewhere else), and the context menu can copy it.
+    """
+
+    #: URL under the cursor, or "" when the cursor left the link.
+    link_hovered = Signal(str)
+    #: URL that was opened in the external browser.
+    link_opened = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -498,6 +514,7 @@ class BodyView(QWidget):
         self._allow_remote = False
         self._web: Optional[QWidget] = None
         self._text: Optional[_MailTextBrowser] = None
+        self._hovered = ""
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -519,9 +536,16 @@ class BodyView(QWidget):
                     settings.setAttribute(attribute, value)
                 except Exception:
                     logger.debug("Could not set web attribute %s", attribute)
+            page.linkHovered.connect(self._on_link_hovered)
+            self._web.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._web.customContextMenuRequested.connect(self._context_menu)
             layout.addWidget(self._web)
         else:
             self._text = _MailTextBrowser(self)
+            self._text.highlighted.connect(self._on_link_hovered)
+            self._text.anchorClicked.connect(lambda url: self.link_opened.emit(url.toString()))
+            self._text.setContextMenuPolicy(Qt.CustomContextMenu)
+            self._text.customContextMenuRequested.connect(self._context_menu)
             layout.addWidget(self._text)
 
     @property
@@ -539,6 +563,16 @@ class BodyView(QWidget):
             resolver = (make_data_uri_resolver(mail) if self._web is not None
                         else make_passthrough_resolver(mail))
             result = sanitize_html(mail.html_body, resolver, allow_remote_images)
+            # A message must never look empty while it has content.  If the HTML
+            # part yields no readable text (malformed markup, everything inside
+            # a dropped element), fall back to the plain-text alternative.
+            if mail.text_body and not html_to_text(result.html).strip():
+                logger.warning("HTML part rendered empty; showing the text part",
+                               extra={"event": "html_empty_fallback",
+                                      "uid": mail.uid, "folder": mail.folder})
+                result = SanitizedHtml(html=text_to_html(mail.text_body),
+                                       trackers_removed=result.trackers_removed,
+                                       remote_images_blocked=result.remote_images_blocked)
         elif mail.text_body:
             result = SanitizedHtml(html=text_to_html(mail.text_body))
         else:
@@ -558,6 +592,51 @@ class BodyView(QWidget):
         elif self._text is not None:
             self._text.set_mail(self._mail)
             self._text.setHtml(document)
+
+    def _on_link_hovered(self, url) -> None:
+        """Qt hands us a QUrl (text browser) or a str (web engine)."""
+        target = url.toString() if hasattr(url, "toString") else str(url or "")
+        self._hovered = target
+        self.link_hovered.emit(target)
+
+    def current_link(self, position=None) -> str:
+        """The link under the cursor, for the context menu."""
+        if self._text is not None and position is not None:
+            anchor = self._text.anchorAt(position)
+            if anchor:
+                return anchor
+        return self._hovered
+
+    def _context_menu(self, position) -> None:
+        menu = QMenu(self)
+        link = self.current_link(position)
+        if link:
+            shown = link if len(link) <= 60 else link[:57] + "…"
+            menu.addAction(f"Open  {shown}", lambda: self.open_link(link))
+            menu.addAction("Copy link address",
+                           lambda: QApplication.clipboard().setText(link))
+            menu.addSeparator()
+        menu.addAction("Copy selected text", self.copy_selection)
+        menu.addAction("Select all", self.select_all)
+        widget = self._web if self._web is not None else self._text
+        if widget is not None:
+            menu.exec(widget.mapToGlobal(position))
+
+    def open_link(self, url: str) -> None:
+        _open_external(QUrl(url))
+        self.link_opened.emit(url)
+
+    def copy_selection(self) -> None:
+        if self._web is not None:
+            self._web.page().triggerAction(QWebEnginePage.WebAction.Copy)
+        elif self._text is not None:
+            self._text.copy()
+
+    def select_all(self) -> None:
+        if self._web is not None:
+            self._web.page().triggerAction(QWebEnginePage.WebAction.SelectAll)
+        elif self._text is not None:
+            self._text.selectAll()
 
     def shutdown(self) -> None:
         """Release the web page before the shared profile goes away.
@@ -1393,6 +1472,8 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(line)
 
         self._body = BodyView()
+        self._body.link_hovered.connect(self._on_link_hovered)
+        self._body.link_opened.connect(self._on_link_opened)
         right_layout.addWidget(self._body, 1)
 
         self._attachments = AttachmentPane(self._settings)
@@ -1755,6 +1836,18 @@ class MainWindow(QMainWindow):
             self._banner.show()
         else:
             self._banner.hide()
+
+    def _on_link_hovered(self, url: str) -> None:
+        """Show where a link really goes before it is clicked."""
+        if url:
+            self.statusBar().showMessage(f"🔗  {url}")
+        else:
+            self.statusBar().clearMessage()
+
+    def _on_link_opened(self, url: str) -> None:
+        self.statusBar().showMessage(f"Opened in your browser: {url}", 8000)
+        logger.info("Opened a link from a message",
+                    extra={"event": "link_opened", "scheme": url.split(":", 1)[0]})
 
     def _toggle_remote_images(self, checked: bool) -> None:
         self._allow_remote_for_current = checked
